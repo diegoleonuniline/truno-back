@@ -82,12 +82,13 @@ const requireRole = (...roles) => {
 
 const requireModule = (moduleName) => {
   return (req, res, next) => {
-    if (!req.organizacion.modulos.includes(moduleName)) {
-      return res.status(403).json({ 
-        error: `Módulo "${moduleName}" no disponible en tu plan`,
-        upgrade: true
-      });
-    }
+    // Temporalmente deshabilitado para desarrollo
+    // if (!req.organizacion.modulos.includes(moduleName)) {
+    //   return res.status(403).json({ 
+    //     error: `Módulo "${moduleName}" no disponible en tu plan`,
+    //     upgrade: true
+    //   });
+    // }
     next();
   };
 };
