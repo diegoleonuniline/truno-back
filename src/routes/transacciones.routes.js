@@ -7,14 +7,15 @@ const { auth, requireOrg } = require('../middlewares/auth.middleware');
 router.get('/', auth, requireOrg, async (req, res, next) => {
   try {
     const { 
-      cuenta_bancaria_id, tipo, buscar, sin_conciliar, conciliado,
+      cuenta_bancaria_id, contacto_id, tipo, buscar, sin_conciliar, conciliado,
       pagina = 1, limite = 20 
     } = req.query;
 
     let sql = `
-      SELECT t.*, cb.nombre as nombre_cuenta
+      SELECT t.*, cb.nombre as nombre_cuenta, c.nombre as nombre_contacto
       FROM transacciones t
       LEFT JOIN cuentas_bancarias cb ON cb.id = t.cuenta_bancaria_id
+      LEFT JOIN contactos c ON c.id = t.contacto_id
       WHERE t.organizacion_id = ?
     `;
     const params = [req.organizacion.id];
@@ -22,6 +23,10 @@ router.get('/', auth, requireOrg, async (req, res, next) => {
     if (cuenta_bancaria_id) {
       sql += ' AND t.cuenta_bancaria_id = ?';
       params.push(cuenta_bancaria_id);
+    }
+    if (contacto_id) {
+      sql += ' AND t.contacto_id = ?';
+      params.push(contacto_id);
     }
     if (tipo) {
       sql += ' AND t.tipo = ?';
@@ -87,7 +92,7 @@ router.get('/:id', auth, requireOrg, async (req, res, next) => {
 router.post('/', auth, requireOrg, async (req, res, next) => {
   try {
     const { 
-      cuenta_bancaria_id, tipo, monto, fecha, 
+      cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
       descripcion, referencia, comprobante_url,
       gasto_id, venta_id
     } = req.body;
@@ -113,12 +118,12 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
 
     await db.query(
       `INSERT INTO transacciones 
-       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, 
+       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
         descripcion, referencia, comprobante_url, gasto_id, venta_id, 
         saldo_despues, creado_por) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoNum, fecha,
-       descripcion || null, referencia || null, comprobante_url || null,
+       contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
        gasto_id || null, venta_id || null, nuevoSaldo, req.usuario.id]
     );
 
@@ -139,18 +144,20 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
 // PUT /api/transacciones/:id
 router.put('/:id', auth, requireOrg, async (req, res, next) => {
   try {
-    const { descripcion, referencia, comprobante_url, gasto_id, venta_id } = req.body;
+    const { descripcion, referencia, comprobante_url, contacto_id, gasto_id, venta_id } = req.body;
 
     const [result] = await db.query(
       `UPDATE transacciones SET 
        descripcion = COALESCE(?, descripcion),
        referencia = ?,
        comprobante_url = ?,
+       contacto_id = ?,
        gasto_id = ?,
        venta_id = ?
        WHERE id = ? AND organizacion_id = ?`,
       [descripcion, referencia || null, comprobante_url || null, 
-       gasto_id || null, venta_id || null, req.params.id, req.organizacion.id]
+       contacto_id || null, gasto_id || null, venta_id || null, 
+       req.params.id, req.organizacion.id]
     );
 
     if (result.affectedRows === 0) {
