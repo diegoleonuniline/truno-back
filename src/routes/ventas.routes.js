@@ -1,15 +1,14 @@
 const router = require('express').Router();
 const { v4: uuidv4 } = require('uuid');
-const { body, validationResult } = require('express-validator');
 const db = require('../config/database');
-const { auth, requireOrg, requireModule } = require('../middlewares/auth.middleware');
+const { auth, requireOrg } = require('../middlewares/auth.middleware');
 
 // GET /api/ventas
-router.get('/', auth, requireOrg, requireModule('ventas'), async (req, res, next) => {
+router.get('/', auth, requireOrg, async (req, res, next) => {
   try {
     const { 
-      contacto_id, estatus, fecha_inicio, fecha_fin, 
-      buscar, pagina = 1, limite = 50 
+      contacto_id, cliente_id, estatus, fecha_inicio, fecha_fin, 
+      buscar, pagina = 1, limite = 20 
     } = req.query;
 
     let sql = `
@@ -20,12 +19,12 @@ router.get('/', auth, requireOrg, requireModule('ventas'), async (req, res, next
     `;
     const params = [req.organizacion.id];
 
-    if (contacto_id) {
+    if (contacto_id || cliente_id) {
       sql += ' AND v.contacto_id = ?';
-      params.push(contacto_id);
+      params.push(contacto_id || cliente_id);
     }
     if (estatus) {
-      sql += ' AND v.estatus_pago = ?';
+      sql += ' AND v.estatus = ?';
       params.push(estatus);
     }
     if (fecha_inicio) {
@@ -37,11 +36,11 @@ router.get('/', auth, requireOrg, requireModule('ventas'), async (req, res, next
       params.push(fecha_fin);
     }
     if (buscar) {
-      sql += ' AND (v.numero_venta LIKE ? OR v.uuid_cfdi LIKE ? OR c.nombre LIKE ?)';
+      sql += ' AND (v.folio LIKE ? OR v.concepto LIKE ? OR c.nombre LIKE ?)';
       params.push(`%${buscar}%`, `%${buscar}%`, `%${buscar}%`);
     }
 
-    const countSql = sql.replace(/SELECT .* FROM/, 'SELECT COUNT(*) as total FROM');
+    const countSql = sql.replace(/SELECT v\.\*.*FROM/s, 'SELECT COUNT(*) as total FROM');
     const [[{ total }]] = await db.query(countSql, params);
 
     const offset = (parseInt(pagina) - 1) * parseInt(limite);
@@ -65,10 +64,10 @@ router.get('/', auth, requireOrg, requireModule('ventas'), async (req, res, next
 });
 
 // GET /api/ventas/:id
-router.get('/:id', auth, requireOrg, requireModule('ventas'), async (req, res, next) => {
+router.get('/:id', auth, requireOrg, async (req, res, next) => {
   try {
     const [ventas] = await db.query(
-      `SELECT v.*, c.nombre as nombre_contacto, c.rfc as rfc_contacto, c.correo as correo_contacto
+      `SELECT v.*, c.nombre as nombre_contacto, c.rfc as rfc_contacto
        FROM ventas v
        LEFT JOIN contactos c ON c.id = v.contacto_id
        WHERE v.id = ? AND v.organizacion_id = ?`,
@@ -86,65 +85,73 @@ router.get('/:id', auth, requireOrg, requireModule('ventas'), async (req, res, n
 });
 
 // POST /api/ventas
-router.post('/', auth, requireOrg, requireModule('ventas'), [
-  body('fecha').isDate(),
-  body('total').isDecimal()
-], async (req, res, next) => {
+router.post('/', auth, requireOrg, async (req, res, next) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
     const { 
-      contacto_id, numero_venta, fecha, fecha_vencimiento, 
-      subtotal, impuesto, descuento, total,
-      moneda, tipo_cambio, notas, uuid_cfdi, folio_cfdi, serie_cfdi,
-      url_archivo_xml, url_archivo_pdf
+      contacto_id, folio, fecha, fecha_vencimiento, concepto,
+      subtotal, impuesto, total, moneda, estatus, notas,
+      impuestos // Array de { impuesto_id, base, importe }
     } = req.body;
+
+    if (!fecha || !total) {
+      return res.status(400).json({ error: 'Fecha y total son requeridos' });
+    }
 
     const ventaId = uuidv4();
 
     await db.query(
       `INSERT INTO ventas 
-       (id, organizacion_id, contacto_id, numero_venta, fecha, fecha_vencimiento, uuid_cfdi, folio_cfdi, serie_cfdi,
-        subtotal, impuesto, descuento, total, moneda, tipo_cambio, notas, url_archivo_xml, url_archivo_pdf, creado_por) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [ventaId, req.organizacion.id, contacto_id || null, numero_venta || null, fecha, fecha_vencimiento || null,
-       uuid_cfdi || null, folio_cfdi || null, serie_cfdi || null, 
-       subtotal || total, impuesto || 0, descuento || 0, total,
-       moneda || 'MXN', tipo_cambio || 1, notas || null, url_archivo_xml || null, url_archivo_pdf || null, req.usuario.id]
+       (id, organizacion_id, contacto_id, folio, fecha, fecha_vencimiento, concepto,
+        subtotal, impuesto, total, moneda, estatus, notas, creado_por) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [ventaId, req.organizacion.id, contacto_id || null, folio || null, fecha, 
+       fecha_vencimiento || null, concepto || null, subtotal || total, impuesto || 0, total,
+       moneda || 'MXN', estatus || 'pendiente', notas || null, req.usuario.id]
     );
 
-    res.status(201).json({ id: ventaId, total });
+    // Guardar impuestos
+    if (impuestos && impuestos.length > 0) {
+      for (const imp of impuestos) {
+        if (imp.impuesto_id) {
+          await db.query(
+            `INSERT INTO venta_impuestos (id, venta_id, impuesto_id, base, importe)
+             VALUES (?, ?, ?, ?, ?)`,
+            [uuidv4(), ventaId, imp.impuesto_id, imp.base || subtotal || total, imp.importe || 0]
+          );
+        }
+      }
+    }
+
+    res.status(201).json({ id: ventaId, mensaje: 'Venta creada' });
   } catch (error) {
     next(error);
   }
 });
 
 // PUT /api/ventas/:id
-router.put('/:id', auth, requireOrg, requireModule('ventas'), async (req, res, next) => {
+router.put('/:id', auth, requireOrg, async (req, res, next) => {
   try {
     const { 
-      contacto_id, numero_venta, fecha, fecha_vencimiento, notas,
-      uuid_cfdi, folio_cfdi, serie_cfdi, url_archivo_xml, url_archivo_pdf
+      contacto_id, folio, fecha, fecha_vencimiento, concepto,
+      subtotal, impuesto, total, estatus, notas
     } = req.body;
 
     const [result] = await db.query(
       `UPDATE ventas SET 
-       contacto_id = COALESCE(?, contacto_id),
-       numero_venta = COALESCE(?, numero_venta),
+       contacto_id = ?,
+       folio = ?,
        fecha = COALESCE(?, fecha),
-       fecha_vencimiento = COALESCE(?, fecha_vencimiento),
-       notas = COALESCE(?, notas),
-       uuid_cfdi = COALESCE(?, uuid_cfdi),
-       folio_cfdi = COALESCE(?, folio_cfdi),
-       serie_cfdi = COALESCE(?, serie_cfdi),
-       url_archivo_xml = COALESCE(?, url_archivo_xml),
-       url_archivo_pdf = COALESCE(?, url_archivo_pdf)
+       fecha_vencimiento = ?,
+       concepto = ?,
+       subtotal = COALESCE(?, subtotal),
+       impuesto = COALESCE(?, impuesto),
+       total = COALESCE(?, total),
+       estatus = COALESCE(?, estatus),
+       notas = ?
        WHERE id = ? AND organizacion_id = ?`,
-      [contacto_id, numero_venta, fecha, fecha_vencimiento, notas, uuid_cfdi, folio_cfdi, serie_cfdi,
-       url_archivo_xml, url_archivo_pdf, req.params.id, req.organizacion.id]
+      [contacto_id || null, folio || null, fecha, fecha_vencimiento || null, 
+       concepto || null, subtotal, impuesto, total, estatus, notas || null,
+       req.params.id, req.organizacion.id]
     );
 
     if (result.affectedRows === 0) {
@@ -158,27 +165,19 @@ router.put('/:id', auth, requireOrg, requireModule('ventas'), async (req, res, n
 });
 
 // DELETE /api/ventas/:id
-router.delete('/:id', auth, requireOrg, requireModule('ventas'), async (req, res, next) => {
+router.delete('/:id', auth, requireOrg, async (req, res, next) => {
   try {
-    const [ventas] = await db.query(
-      'SELECT monto_pagado FROM ventas WHERE id = ? AND organizacion_id = ?',
+    // Limpiar impuestos primero
+    await db.query('DELETE FROM venta_impuestos WHERE venta_id = ?', [req.params.id]).catch(() => {});
+    
+    const [result] = await db.query(
+      'DELETE FROM ventas WHERE id = ? AND organizacion_id = ?',
       [req.params.id, req.organizacion.id]
     );
 
-    if (!ventas.length) {
+    if (result.affectedRows === 0) {
       return res.status(404).json({ error: 'Venta no encontrada' });
     }
-
-    if (parseFloat(ventas[0].monto_pagado) > 0) {
-      return res.status(400).json({ error: 'No se puede eliminar una venta con pagos registrados' });
-    }
-
-    await db.query(
-      'UPDATE transacciones_bancarias SET venta_vinculada_id = NULL WHERE venta_vinculada_id = ?',
-      [req.params.id]
-    );
-
-    await db.query('DELETE FROM ventas WHERE id = ?', [req.params.id]);
 
     res.json({ mensaje: 'Venta eliminada' });
   } catch (error) {
