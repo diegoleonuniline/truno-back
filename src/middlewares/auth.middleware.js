@@ -11,16 +11,16 @@ const auth = async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
-    const [users] = await db.query(
-      'SELECT id, email, first_name, last_name, is_active FROM users WHERE id = ?',
-      [decoded.userId]
+    const [usuarios] = await db.query(
+      'SELECT id, correo, nombre, apellido, activo FROM usuarios WHERE id = ?',
+      [decoded.usuarioId]
     );
 
-    if (!users.length || !users[0].is_active) {
+    if (!usuarios.length || !usuarios[0].activo) {
       return res.status(401).json({ error: 'Usuario no válido' });
     }
 
-    req.user = users[0];
+    req.usuario = usuarios[0];
     req.token = token;
     next();
   } catch (error) {
@@ -40,29 +40,29 @@ const requireOrg = async (req, res, next) => {
     }
 
     const [userOrgs] = await db.query(
-      `SELECT uo.*, o.name as org_name, o.is_active as org_active,
-              s.plan_name, s.modules
-       FROM user_organizations uo
-       JOIN organizations o ON o.id = uo.organization_id
-       LEFT JOIN subscriptions s ON s.organization_id = o.id AND s.is_active = 1
-       WHERE uo.user_id = ? AND uo.organization_id = ?`,
-      [req.user.id, orgId]
+      `SELECT uo.*, o.nombre as org_nombre, o.activo as org_activo,
+              s.nombre_plan, s.modulos
+       FROM usuario_organizaciones uo
+       JOIN organizaciones o ON o.id = uo.organizacion_id
+       LEFT JOIN suscripciones s ON s.organizacion_id = o.id AND s.activo = 1
+       WHERE uo.usuario_id = ? AND uo.organizacion_id = ?`,
+      [req.usuario.id, orgId]
     );
 
     if (!userOrgs.length) {
       return res.status(403).json({ error: 'Sin acceso a esta organización' });
     }
 
-    if (!userOrgs[0].org_active) {
+    if (!userOrgs[0].org_activo) {
       return res.status(403).json({ error: 'Organización inactiva' });
     }
 
-    req.organization = {
+    req.organizacion = {
       id: orgId,
-      name: userOrgs[0].org_name,
-      role: userOrgs[0].role,
-      plan: userOrgs[0].plan_name || 'free',
-      modules: userOrgs[0].modules ? JSON.parse(userOrgs[0].modules) : ['bancos']
+      nombre: userOrgs[0].org_nombre,
+      rol: userOrgs[0].rol,
+      plan: userOrgs[0].nombre_plan || 'free',
+      modulos: userOrgs[0].modulos ? JSON.parse(userOrgs[0].modulos) : ['bancos']
     };
 
     next();
@@ -73,7 +73,7 @@ const requireOrg = async (req, res, next) => {
 
 const requireRole = (...roles) => {
   return (req, res, next) => {
-    if (!roles.includes(req.organization.role)) {
+    if (!roles.includes(req.organizacion.rol)) {
       return res.status(403).json({ error: 'Permisos insuficientes' });
     }
     next();
@@ -82,7 +82,7 @@ const requireRole = (...roles) => {
 
 const requireModule = (moduleName) => {
   return (req, res, next) => {
-    if (!req.organization.modules.includes(moduleName)) {
+    if (!req.organizacion.modulos.includes(moduleName)) {
       return res.status(403).json({ 
         error: `Módulo "${moduleName}" no disponible en tu plan`,
         upgrade: true

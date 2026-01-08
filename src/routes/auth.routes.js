@@ -8,10 +8,10 @@ const { auth } = require('../middlewares/auth.middleware');
 
 // POST /api/auth/register
 router.post('/register', [
-  body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }),
-  body('first_name').trim().notEmpty(),
-  body('last_name').trim().notEmpty()
+  body('correo').isEmail().normalizeEmail(),
+  body('contrasena').isLength({ min: 8 }),
+  body('nombre').trim().notEmpty(),
+  body('apellido').trim().notEmpty()
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
@@ -19,51 +19,48 @@ router.post('/register', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { email, password, first_name, last_name, phone } = req.body;
+    const { correo, contrasena, nombre, apellido, telefono } = req.body;
 
-    // Verificar email existente
-    const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
+    const [existing] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
     if (existing.length) {
-      return res.status(400).json({ error: 'Email ya registrado' });
+      return res.status(400).json({ error: 'El correo ya está registrado' });
     }
 
-    const userId = uuidv4();
-    const passwordHash = await bcrypt.hash(password, 12);
+    const usuarioId = uuidv4();
+    const contrasenaHash = await bcrypt.hash(contrasena, 12);
 
     await db.query(
-      `INSERT INTO users (id, email, password_hash, first_name, last_name, phone) 
+      `INSERT INTO usuarios (id, correo, contrasena_hash, nombre, apellido, telefono) 
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [userId, email, passwordHash, first_name, last_name, phone || null]
+      [usuarioId, correo, contrasenaHash, nombre, apellido, telefono || null]
     );
 
-    // Crear organización personal por defecto
     const orgId = uuidv4();
     await db.query(
-      `INSERT INTO organizations (id, name, type) VALUES (?, ?, 'persona_fisica')`,
-      [orgId, `${first_name} ${last_name}`]
+      `INSERT INTO organizaciones (id, nombre, tipo) VALUES (?, ?, 'persona_fisica')`,
+      [orgId, `${nombre} ${apellido}`]
     );
 
     await db.query(
-      `INSERT INTO user_organizations (id, user_id, organization_id, role, is_default) 
-       VALUES (?, ?, ?, 'owner', 1)`,
-      [uuidv4(), userId, orgId]
+      `INSERT INTO usuario_organizaciones (id, usuario_id, organizacion_id, rol, es_predeterminada) 
+       VALUES (?, ?, ?, 'propietario', 1)`,
+      [uuidv4(), usuarioId, orgId]
     );
 
-    // Crear suscripción free
     await db.query(
-      `INSERT INTO subscriptions (id, organization_id, plan_name, modules, max_users, max_transactions) 
+      `INSERT INTO suscripciones (id, organizacion_id, nombre_plan, modulos, max_usuarios, max_transacciones) 
        VALUES (?, ?, 'free', '["bancos"]', 1, 100)`,
       [uuidv4(), orgId]
     );
 
-    const token = jwt.sign({ userId }, process.env.JWT_SECRET, { 
+    const token = jwt.sign({ odersId: usuarioId }, process.env.JWT_SECRET, { 
       expiresIn: process.env.JWT_EXPIRES_IN 
     });
 
     res.status(201).json({
-      message: 'Usuario registrado exitosamente',
+      mensaje: 'Usuario registrado exitosamente',
       token,
-      user: { id: userId, email, first_name, last_name }
+      usuario: { id: usuarioId, correo, nombre, apellido }
     });
   } catch (error) {
     next(error);
@@ -72,8 +69,8 @@ router.post('/register', [
 
 // POST /api/auth/login
 router.post('/login', [
-  body('email').isEmail().normalizeEmail(),
-  body('password').notEmpty()
+  body('correo').isEmail().normalizeEmail(),
+  body('contrasena').notEmpty()
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
@@ -81,42 +78,41 @@ router.post('/login', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { email, password } = req.body;
+    const { correo, contrasena } = req.body;
 
-    const [users] = await db.query(
-      'SELECT * FROM users WHERE email = ?',
-      [email]
+    const [usuarios] = await db.query(
+      'SELECT * FROM usuarios WHERE correo = ?',
+      [correo]
     );
 
-    if (!users.length) {
+    if (!usuarios.length) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    const user = users[0];
+    const usuario = usuarios[0];
 
-    if (!user.is_active) {
+    if (!usuario.activo) {
       return res.status(401).json({ error: 'Cuenta desactivada' });
     }
 
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) {
+    const contrasenaValida = await bcrypt.compare(contrasena, usuario.contrasena_hash);
+    if (!contrasenaValida) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    // Actualizar último login
-    await db.query('UPDATE users SET last_login = NOW() WHERE id = ?', [user.id]);
+    await db.query('UPDATE usuarios SET ultimo_acceso = NOW() WHERE id = ?', [usuario.id]);
 
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { 
+    const token = jwt.sign({ usuarioId: usuario.id }, process.env.JWT_SECRET, { 
       expiresIn: process.env.JWT_EXPIRES_IN 
     });
 
     res.json({
       token,
-      user: {
-        id: user.id,
-        email: user.email,
-        first_name: user.first_name,
-        last_name: user.last_name
+      usuario: {
+        id: usuario.id,
+        correo: usuario.correo,
+        nombre: usuario.nombre,
+        apellido: usuario.apellido
       }
     });
   } catch (error) {
@@ -128,27 +124,27 @@ router.post('/login', [
 router.get('/me', auth, async (req, res, next) => {
   try {
     const [orgs] = await db.query(
-      `SELECT o.*, uo.role, uo.is_default,
-              s.plan_name, s.modules
-       FROM user_organizations uo
-       JOIN organizations o ON o.id = uo.organization_id
-       LEFT JOIN subscriptions s ON s.organization_id = o.id AND s.is_active = 1
-       WHERE uo.user_id = ?
-       ORDER BY uo.is_default DESC, o.name`,
-      [req.user.id]
+      `SELECT o.*, uo.rol, uo.es_predeterminada,
+              s.nombre_plan, s.modulos
+       FROM usuario_organizaciones uo
+       JOIN organizaciones o ON o.id = uo.organizacion_id
+       LEFT JOIN suscripciones s ON s.organizacion_id = o.id AND s.activo = 1
+       WHERE uo.usuario_id = ?
+       ORDER BY uo.es_predeterminada DESC, o.nombre`,
+      [req.usuario.id]
     );
 
     res.json({
-      user: req.user,
-      organizations: orgs.map(o => ({
+      usuario: req.usuario,
+      organizaciones: orgs.map(o => ({
         id: o.id,
-        name: o.name,
-        type: o.type,
-        role: o.role,
-        is_default: o.is_default,
-        is_active: o.is_active,
-        plan: o.plan_name || 'free',
-        modules: o.modules ? JSON.parse(o.modules) : ['bancos']
+        nombre: o.nombre,
+        tipo: o.tipo,
+        rol: o.rol,
+        es_predeterminada: o.es_predeterminada,
+        activo: o.activo,
+        plan: o.nombre_plan || 'free',
+        modulos: o.modulos ? JSON.parse(o.modulos) : ['bancos']
       }))
     });
   } catch (error) {
@@ -156,10 +152,10 @@ router.get('/me', auth, async (req, res, next) => {
   }
 });
 
-// POST /api/auth/change-password
-router.post('/change-password', auth, [
-  body('current_password').notEmpty(),
-  body('new_password').isLength({ min: 8 })
+// POST /api/auth/cambiar-contrasena
+router.post('/cambiar-contrasena', auth, [
+  body('contrasena_actual').notEmpty(),
+  body('contrasena_nueva').isLength({ min: 8 })
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
@@ -167,22 +163,22 @@ router.post('/change-password', auth, [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { current_password, new_password } = req.body;
+    const { contrasena_actual, contrasena_nueva } = req.body;
 
-    const [users] = await db.query(
-      'SELECT password_hash FROM users WHERE id = ?',
-      [req.user.id]
+    const [usuarios] = await db.query(
+      'SELECT contrasena_hash FROM usuarios WHERE id = ?',
+      [req.usuario.id]
     );
 
-    const valid = await bcrypt.compare(current_password, users[0].password_hash);
-    if (!valid) {
+    const valida = await bcrypt.compare(contrasena_actual, usuarios[0].contrasena_hash);
+    if (!valida) {
       return res.status(400).json({ error: 'Contraseña actual incorrecta' });
     }
 
-    const newHash = await bcrypt.hash(new_password, 12);
-    await db.query('UPDATE users SET password_hash = ? WHERE id = ?', [newHash, req.user.id]);
+    const nuevoHash = await bcrypt.hash(contrasena_nueva, 12);
+    await db.query('UPDATE usuarios SET contrasena_hash = ? WHERE id = ?', [nuevoHash, req.usuario.id]);
 
-    res.json({ message: 'Contraseña actualizada' });
+    res.json({ mensaje: 'Contraseña actualizada' });
   } catch (error) {
     next(error);
   }

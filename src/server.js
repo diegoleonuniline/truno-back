@@ -27,17 +27,13 @@ app.use('/api/', limiter);
 
 // Rutas
 app.use('/api/auth', require('./routes/auth.routes'));
-app.use('/api/organizations', require('./routes/organizations.routes'));
-app.use('/api/bank-accounts', require('./routes/bankAccounts.routes'));
-app.use('/api/transactions', require('./routes/transactions.routes'));
-app.use('/api/contacts', require('./routes/contacts.routes'));
-app.use('/api/sales', require('./routes/sales.routes'));
-app.use('/api/expenses', require('./routes/expenses.routes'));
-app.use('/api/payments', require('./routes/payments.routes'));
-app.use('/api/categories', require('./routes/categories.routes'));
-app.use('/api/reports', require('./routes/reports.routes'));
-app.use('/api/upload', require('./routes/upload.routes'));
-app.use('/api/sat', require('./routes/sat.routes'));
+app.use('/api/organizaciones', require('./routes/organizaciones.routes'));
+app.use('/api/cuentas-bancarias', require('./routes/cuentasBancarias.routes'));
+app.use('/api/transacciones', require('./routes/transacciones.routes'));
+app.use('/api/contactos', require('./routes/contactos.routes'));
+app.use('/api/ventas', require('./routes/ventas.routes'));
+app.use('/api/gastos', require('./routes/gastos.routes'));
+app.use('/api/reportes', require('./routes/reportes.routes'));
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
