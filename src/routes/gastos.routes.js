@@ -107,7 +107,8 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
       categoria_id, subcategoria_id,
       subtotal, impuesto, total, moneda, metodo_pago,
       es_fiscal, factura_recibida, factura_validada,
-      uuid_cfdi, folio_cfdi, transaccion_id, comprobante_url, notas
+      uuid_cfdi, folio_cfdi, transaccion_id, comprobante_url, notas,
+      impuestos // Array de { impuesto_id, base, importe }
     } = req.body;
 
     if (!fecha || !total) {
@@ -130,6 +131,19 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
        uuid_cfdi || null, folio_cfdi || null, transaccion_id || null, 
        comprobante_url || null, notas || null, req.usuario.id]
     );
+
+    // Guardar impuestos si existen
+    if (impuestos && impuestos.length > 0) {
+      for (const imp of impuestos) {
+        if (imp.impuesto_id) {
+          await db.query(
+            `INSERT INTO gasto_impuestos (id, gasto_id, impuesto_id, base, importe)
+             VALUES (?, ?, ?, ?, ?)`,
+            [uuidv4(), gastoId, imp.impuesto_id, imp.base || subtotal || total, imp.importe || 0]
+          );
+        }
+      }
+    }
 
     res.status(201).json({ id: gastoId, mensaje: 'Gasto creado' });
   } catch (error) {

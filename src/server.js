@@ -34,6 +34,7 @@ app.use('/api/contactos', require('./routes/contactos.routes'));
 app.use('/api/ventas', require('./routes/ventas.routes'));
 app.use('/api/gastos', require('./routes/gastos.routes'));
 app.use('/api/categorias', require('./routes/categorias.routes'));
+app.use('/api/impuestos', require('./routes/impuestos.routes'));
 app.use('/api/reportes', require('./routes/reportes.routes'));
 
 // Health check
