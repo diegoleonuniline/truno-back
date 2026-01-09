@@ -1,187 +1,169 @@
-const router = require('express').Router();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
-const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
-const { auth } = require('../middlewares/auth.middleware');
+const crypto = require('crypto');
 
-// POST /api/auth/register
-router.post('/register', [
-  body('correo').isEmail().normalizeEmail(),
-  body('contrasena').isLength({ min: 8 }),
-  body('nombre').trim().notEmpty(),
-  body('apellido').trim().notEmpty()
-], async (req, res, next) => {
+// Almacén temporal de challenges (en producción usar Redis)
+const challenges = new Map();
+
+// POST /api/auth/webauthn/register-options
+router.post('/webauthn/register-options', auth, async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    const challenge = crypto.randomBytes(32).toString('base64url');
+    
+    // Guardar challenge temporalmente (5 min)
+    challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
 
-    const { correo, contrasena, nombre, apellido, telefono } = req.body;
+    const options = {
+      challenge,
+      rp: {
+        name: 'TRUNO',
+        id: 'diegoleonuniline.github.io' // Tu dominio
+      },
+      user: {
+        id: Buffer.from(req.usuario.id).toString('base64url'),
+        name: req.usuario.correo,
+        displayName: `${req.usuario.nombre} ${req.usuario.apellido || ''}`
+      },
+      pubKeyCredParams: [
+        { alg: -7, type: 'public-key' },   // ES256
+        { alg: -257, type: 'public-key' }  // RS256
+      ],
+      timeout: 60000,
+      attestation: 'none',
+      authenticatorSelection: {
+        authenticatorAttachment: 'platform', // Face ID, Touch ID
+        userVerification: 'required',
+        residentKey: 'preferred'
+      }
+    };
 
-    const [existing] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
-    if (existing.length) {
-      return res.status(400).json({ error: 'El correo ya está registrado' });
-    }
-
-    const usuarioId = uuidv4();
-    const contrasenaHash = await bcrypt.hash(contrasena, 12);
-
-    await db.query(
-      `INSERT INTO usuarios (id, correo, contrasena_hash, nombre, apellido, telefono) 
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [usuarioId, correo, contrasenaHash, nombre, apellido, telefono || null]
-    );
-
-    const orgId = uuidv4();
-    await db.query(
-      `INSERT INTO organizaciones (id, nombre, tipo) VALUES (?, ?, 'persona_fisica')`,
-      [orgId, `${nombre} ${apellido}`]
-    );
-
-    await db.query(
-      `INSERT INTO usuario_organizaciones (id, usuario_id, organizacion_id, rol, es_predeterminada) 
-       VALUES (?, ?, ?, 'propietario', 1)`,
-      [uuidv4(), usuarioId, orgId]
-    );
-
-    await db.query(
-      `INSERT INTO suscripciones (id, organizacion_id, nombre_plan, modulos, max_usuarios, max_transacciones) 
-       VALUES (?, ?, 'free', '["bancos"]', 1, 100)`,
-      [uuidv4(), orgId]
-    );
-
-    const token = jwt.sign({ odersId: usuarioId }, process.env.JWT_SECRET, { 
-      expiresIn: process.env.JWT_EXPIRES_IN 
-    });
-
-    res.status(201).json({
-      mensaje: 'Usuario registrado exitosamente',
-      token,
-      usuario: { id: usuarioId, correo, nombre, apellido }
-    });
+    res.json(options);
   } catch (error) {
-    next(error);
+    console.error('WebAuthn register options error:', error);
+    res.status(500).json({ error: 'Error generando opciones' });
   }
 });
 
-// POST /api/auth/login
-router.post('/login', [
-  body('correo').isEmail().normalizeEmail(),
-  body('contrasena').notEmpty()
-], async (req, res, next) => {
+// POST /api/auth/webauthn/register
+router.post('/webauthn/register', auth, async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+    const { credential } = req.body;
+    const stored = challenges.get(req.usuario.id);
+
+    if (!stored || Date.now() > stored.expires) {
+      return res.status(400).json({ error: 'Challenge expirado' });
     }
 
-    const { correo, contrasena } = req.body;
+    // Guardar credencial en BD
+    await db.query(
+      `INSERT INTO webauthn_credentials (id, usuario_id, credential_id, public_key, counter, created_at)
+       VALUES (UUID(), ?, ?, ?, 0, NOW())`,
+      [req.usuario.id, credential.id, JSON.stringify(credential)]
+    );
 
+    challenges.delete(req.usuario.id);
+
+    res.json({ mensaje: 'Biometría registrada correctamente' });
+  } catch (error) {
+    console.error('WebAuthn register error:', error);
+    res.status(500).json({ error: 'Error registrando credencial' });
+  }
+});
+
+// POST /api/auth/webauthn/login-options
+router.post('/webauthn/login-options', async (req, res) => {
+  try {
+    const { correo } = req.body;
+
+    // Buscar usuario y sus credenciales
     const [usuarios] = await db.query(
-      'SELECT * FROM usuarios WHERE correo = ?',
+      'SELECT id FROM usuarios WHERE correo = ?',
       [correo]
     );
 
     if (!usuarios.length) {
-      return res.status(401).json({ error: 'Credenciales inválidas' });
+      return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    const usuario = usuarios[0];
+    const [credentials] = await db.query(
+      'SELECT credential_id FROM webauthn_credentials WHERE usuario_id = ?',
+      [usuarios[0].id]
+    );
 
-    if (!usuario.activo) {
-      return res.status(401).json({ error: 'Cuenta desactivada' });
+    if (!credentials.length) {
+      return res.status(404).json({ error: 'No hay biometría configurada' });
     }
 
-    const contrasenaValida = await bcrypt.compare(contrasena, usuario.contrasena_hash);
-    if (!contrasenaValida) {
-      return res.status(401).json({ error: 'Credenciales inválidas' });
+    const challenge = crypto.randomBytes(32).toString('base64url');
+    challenges.set(correo, { challenge, expires: Date.now() + 300000 });
+
+    const options = {
+      challenge,
+      timeout: 60000,
+      rpId: 'diegoleonuniline.github.io',
+      userVerification: 'required',
+      allowCredentials: credentials.map(c => ({
+        id: c.credential_id,
+        type: 'public-key',
+        transports: ['internal']
+      }))
+    };
+
+    res.json(options);
+  } catch (error) {
+    console.error('WebAuthn login options error:', error);
+    res.status(500).json({ error: 'Error generando opciones' });
+  }
+});
+
+// POST /api/auth/webauthn/login
+router.post('/webauthn/login', async (req, res) => {
+  try {
+    const { correo, credential } = req.body;
+    const stored = challenges.get(correo);
+
+    if (!stored || Date.now() > stored.expires) {
+      return res.status(400).json({ error: 'Challenge expirado' });
     }
 
-    await db.query('UPDATE usuarios SET ultimo_acceso = NOW() WHERE id = ?', [usuario.id]);
+    // Buscar credencial
+    const [creds] = await db.query(
+      `SELECT wc.*, u.id as usuario_id, u.nombre, u.apellido, u.correo, u.rol
+       FROM webauthn_credentials wc
+       JOIN usuarios u ON u.id = wc.usuario_id
+       WHERE wc.credential_id = ? AND u.correo = ?`,
+      [credential.id, correo]
+    );
 
-    const token = jwt.sign({ usuarioId: usuario.id }, process.env.JWT_SECRET, { 
-      expiresIn: process.env.JWT_EXPIRES_IN 
-    });
+    if (!creds.length) {
+      return res.status(401).json({ error: 'Credencial no válida' });
+    }
+
+    // Actualizar contador
+    await db.query(
+      'UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?',
+      [credential.id]
+    );
+
+    challenges.delete(correo);
+
+    // Generar token
+    const token = jwt.sign(
+      { id: creds[0].usuario_id, correo: creds[0].correo },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
     res.json({
       token,
       usuario: {
-        id: usuario.id,
-        correo: usuario.correo,
-        nombre: usuario.nombre,
-        apellido: usuario.apellido
+        id: creds[0].usuario_id,
+        nombre: creds[0].nombre,
+        apellido: creds[0].apellido,
+        correo: creds[0].correo,
+        rol: creds[0].rol
       }
     });
   } catch (error) {
-    next(error);
+    console.error('WebAuthn login error:', error);
+    res.status(500).json({ error: 'Error de autenticación' });
   }
 });
-
-// GET /api/auth/me
-router.get('/me', auth, async (req, res, next) => {
-  try {
-    const [orgs] = await db.query(
-      `SELECT o.*, uo.rol, uo.es_predeterminada,
-              s.nombre_plan, s.modulos
-       FROM usuario_organizaciones uo
-       JOIN organizaciones o ON o.id = uo.organizacion_id
-       LEFT JOIN suscripciones s ON s.organizacion_id = o.id AND s.activo = 1
-       WHERE uo.usuario_id = ?
-       ORDER BY uo.es_predeterminada DESC, o.nombre`,
-      [req.usuario.id]
-    );
-
-    res.json({
-      usuario: req.usuario,
-      organizaciones: orgs.map(o => ({
-        id: o.id,
-        nombre: o.nombre,
-        tipo: o.tipo,
-        rol: o.rol,
-        es_predeterminada: o.es_predeterminada,
-        activo: o.activo,
-        plan: o.nombre_plan || 'free',
-        modulos: o.modulos ? JSON.parse(o.modulos) : ['bancos']
-      }))
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// POST /api/auth/cambiar-contrasena
-router.post('/cambiar-contrasena', auth, [
-  body('contrasena_actual').notEmpty(),
-  body('contrasena_nueva').isLength({ min: 8 })
-], async (req, res, next) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { contrasena_actual, contrasena_nueva } = req.body;
-
-    const [usuarios] = await db.query(
-      'SELECT contrasena_hash FROM usuarios WHERE id = ?',
-      [req.usuario.id]
-    );
-
-    const valida = await bcrypt.compare(contrasena_actual, usuarios[0].contrasena_hash);
-    if (!valida) {
-      return res.status(400).json({ error: 'Contraseña actual incorrecta' });
-    }
-
-    const nuevoHash = await bcrypt.hash(contrasena_nueva, 12);
-    await db.query('UPDATE usuarios SET contrasena_hash = ? WHERE id = ?', [nuevoHash, req.usuario.id]);
-
-    res.json({ mensaje: 'Contraseña actualizada' });
-  } catch (error) {
-    next(error);
-  }
-});
-
-module.exports = router;
