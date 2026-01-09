@@ -49,7 +49,6 @@ router.get('/', auth, requireOrg, async (req, res, next) => {
       params.push(`%${buscar}%`, `%${buscar}%`, `%${buscar}%`);
     }
 
-    // Count
     const countSql = sql.replace(/SELECT g\.\*.*FROM/s, 'SELECT COUNT(*) as total FROM');
     const [[{ total }]] = await db.query(countSql, params);
 
@@ -108,7 +107,8 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
       subtotal, impuesto, total, moneda, metodo_pago,
       es_fiscal, factura_recibida, factura_validada,
       uuid_cfdi, folio_cfdi, transaccion_id, comprobante_url, notas,
-      impuestos // Array de { impuesto_id, base, importe }
+      estatus_pago,
+      impuestos
     } = req.body;
 
     if (!fecha || !total) {
@@ -116,23 +116,33 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
     }
 
     const gastoId = uuidv4();
+    const estatusFinal = estatus_pago || 'pendiente';
+    const montoPagado = estatusFinal === 'pagado' ? parseFloat(total) : 0;
 
     await db.query(
       `INSERT INTO gastos 
        (id, organizacion_id, concepto, proveedor_id, fecha, fecha_vencimiento, 
         categoria_id, subcategoria_id, subtotal, impuesto, total, moneda, metodo_pago,
         es_fiscal, factura_recibida, factura_validada, uuid_cfdi, folio_cfdi,
-        transaccion_id, comprobante_url, notas, creado_por) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        transaccion_id, comprobante_url, notas, estatus_pago, monto_pagado, creado_por) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [gastoId, req.organizacion.id, concepto || null, proveedor_id || null, 
        fecha, fecha_vencimiento || null, categoria_id || null, subcategoria_id || null,
        subtotal || total, impuesto || 0, total, moneda || 'MXN', metodo_pago || null,
        es_fiscal ? 1 : 0, factura_recibida ? 1 : 0, factura_validada ? 1 : 0,
        uuid_cfdi || null, folio_cfdi || null, transaccion_id || null, 
-       comprobante_url || null, notas || null, req.usuario.id]
+       comprobante_url || null, notas || null, estatusFinal, montoPagado, req.usuario.id]
     );
 
-    // Guardar impuestos si existen
+    // Vincular transacción con este gasto (relación bidireccional)
+    if (transaccion_id) {
+      await db.query(
+        'UPDATE transacciones SET gasto_id = ? WHERE id = ? AND organizacion_id = ?',
+        [gastoId, transaccion_id, req.organizacion.id]
+      );
+    }
+
+    // Guardar impuestos
     if (impuestos && impuestos.length > 0) {
       for (const imp of impuestos) {
         if (imp.impuesto_id) {
@@ -145,7 +155,7 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
       }
     }
 
-    res.status(201).json({ id: gastoId, mensaje: 'Gasto creado' });
+    res.status(201).json({ id: gastoId, gasto: { id: gastoId }, mensaje: 'Gasto creado' });
   } catch (error) {
     next(error);
   }
@@ -158,8 +168,26 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
       concepto, proveedor_id, fecha, fecha_vencimiento,
       categoria_id, subcategoria_id, subtotal, impuesto, total, moneda, metodo_pago,
       es_fiscal, factura_recibida, factura_validada, uuid_cfdi, folio_cfdi,
-      transaccion_id, comprobante_url, notas
+      transaccion_id, comprobante_url, notas, estatus_pago
     } = req.body;
+
+    // Obtener gasto actual para comparar transaccion_id
+    const [gastoActual] = await db.query(
+      'SELECT transaccion_id, total FROM gastos WHERE id = ? AND organizacion_id = ?',
+      [req.params.id, req.organizacion.id]
+    );
+
+    if (!gastoActual.length) {
+      return res.status(404).json({ error: 'Gasto no encontrado' });
+    }
+
+    // Calcular monto_pagado
+    let montoPagado = null;
+    if (estatus_pago === 'pagado') {
+      montoPagado = total || gastoActual[0].total;
+    } else if (estatus_pago === 'pendiente') {
+      montoPagado = 0;
+    }
 
     const [result] = await db.query(
       `UPDATE gastos SET 
@@ -174,24 +202,48 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
        total = COALESCE(?, total),
        moneda = COALESCE(?, moneda),
        metodo_pago = ?,
-       es_fiscal = ?,
-       factura_recibida = ?,
-       factura_validada = ?,
+       es_fiscal = COALESCE(?, es_fiscal),
+       factura_recibida = COALESCE(?, factura_recibida),
+       factura_validada = COALESCE(?, factura_validada),
        uuid_cfdi = ?,
        folio_cfdi = ?,
        transaccion_id = ?,
        comprobante_url = ?,
-       notas = ?
+       notas = ?,
+       estatus_pago = COALESCE(?, estatus_pago),
+       monto_pagado = COALESCE(?, monto_pagado)
        WHERE id = ? AND organizacion_id = ?`,
       [concepto, proveedor_id || null, fecha, fecha_vencimiento || null,
        categoria_id || null, subcategoria_id || null, subtotal, impuesto, total, moneda, 
-       metodo_pago || null, es_fiscal ? 1 : 0, factura_recibida ? 1 : 0, factura_validada ? 1 : 0,
-       uuid_cfdi || null, folio_cfdi || null, transaccion_id || null,
-       comprobante_url || null, notas || null, req.params.id, req.organizacion.id]
+       metodo_pago || null, 
+       es_fiscal !== undefined ? (es_fiscal ? 1 : 0) : null,
+       factura_recibida !== undefined ? (factura_recibida ? 1 : 0) : null,
+       factura_validada !== undefined ? (factura_validada ? 1 : 0) : null,
+       uuid_cfdi || null, folio_cfdi || null, transaccion_id !== undefined ? transaccion_id : gastoActual[0].transaccion_id,
+       comprobante_url || null, notas || null, estatus_pago || null, montoPagado,
+       req.params.id, req.organizacion.id]
     );
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Gasto no encontrado' });
+    // Actualizar relación bidireccional con transacciones
+    const oldTxId = gastoActual[0].transaccion_id;
+    const newTxId = transaccion_id;
+
+    // Si cambió la transacción vinculada
+    if (newTxId !== undefined && newTxId !== oldTxId) {
+      // Desvincular transacción anterior
+      if (oldTxId) {
+        await db.query(
+          'UPDATE transacciones SET gasto_id = NULL WHERE id = ?',
+          [oldTxId]
+        );
+      }
+      // Vincular nueva transacción
+      if (newTxId) {
+        await db.query(
+          'UPDATE transacciones SET gasto_id = ? WHERE id = ? AND organizacion_id = ?',
+          [req.params.id, newTxId, req.organizacion.id]
+        );
+      }
     }
 
     res.json({ mensaje: 'Gasto actualizado' });
@@ -203,14 +255,32 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
 // DELETE /api/gastos/:id
 router.delete('/:id', auth, requireOrg, async (req, res, next) => {
   try {
-    const [result] = await db.query(
-      'DELETE FROM gastos WHERE id = ? AND organizacion_id = ?',
+    // Obtener gasto para limpiar relaciones
+    const [gasto] = await db.query(
+      'SELECT transaccion_id FROM gastos WHERE id = ? AND organizacion_id = ?',
       [req.params.id, req.organizacion.id]
     );
 
-    if (result.affectedRows === 0) {
+    if (!gasto.length) {
       return res.status(404).json({ error: 'Gasto no encontrado' });
     }
+
+    // Desvincular transacción si existe
+    if (gasto[0].transaccion_id) {
+      await db.query(
+        'UPDATE transacciones SET gasto_id = NULL WHERE id = ?',
+        [gasto[0].transaccion_id]
+      );
+    }
+
+    // Eliminar impuestos asociados
+    await db.query('DELETE FROM gasto_impuestos WHERE gasto_id = ?', [req.params.id]);
+
+    // Eliminar gasto
+    await db.query(
+      'DELETE FROM gastos WHERE id = ? AND organizacion_id = ?',
+      [req.params.id, req.organizacion.id]
+    );
 
     res.json({ mensaje: 'Gasto eliminado' });
   } catch (error) {
