@@ -1,153 +1,45 @@
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const db = require('../config/db');
+const { auth } = require('../middleware/auth');
 
 // Almacén temporal de challenges (en producción usar Redis)
 const challenges = new Map();
 
-// POST /api/auth/webauthn/register-options
-router.post('/webauthn/register-options', auth, async (req, res) => {
+// ========================================
+// LOGIN TRADICIONAL
+// ========================================
+
+// POST /api/auth/login
+router.post('/login', async (req, res) => {
   try {
-    const challenge = crypto.randomBytes(32).toString('base64url');
-    
-    // Guardar challenge temporalmente (5 min)
-    challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
+    const { correo, contrasena } = req.body;
 
-    const options = {
-      challenge,
-      rp: {
-        name: 'TRUNO',
-        id: 'diegoleonuniline.github.io' // Tu dominio
-      },
-      user: {
-        id: Buffer.from(req.usuario.id).toString('base64url'),
-        name: req.usuario.correo,
-        displayName: `${req.usuario.nombre} ${req.usuario.apellido || ''}`
-      },
-      pubKeyCredParams: [
-        { alg: -7, type: 'public-key' },   // ES256
-        { alg: -257, type: 'public-key' }  // RS256
-      ],
-      timeout: 60000,
-      attestation: 'none',
-      authenticatorSelection: {
-        authenticatorAttachment: 'platform', // Face ID, Touch ID
-        userVerification: 'required',
-        residentKey: 'preferred'
-      }
-    };
-
-    res.json(options);
-  } catch (error) {
-    console.error('WebAuthn register options error:', error);
-    res.status(500).json({ error: 'Error generando opciones' });
-  }
-});
-
-// POST /api/auth/webauthn/register
-router.post('/webauthn/register', auth, async (req, res) => {
-  try {
-    const { credential } = req.body;
-    const stored = challenges.get(req.usuario.id);
-
-    if (!stored || Date.now() > stored.expires) {
-      return res.status(400).json({ error: 'Challenge expirado' });
+    if (!correo || !contrasena) {
+      return res.status(400).json({ error: 'Correo y contraseña son requeridos' });
     }
 
-    // Guardar credencial en BD
-    await db.query(
-      `INSERT INTO webauthn_credentials (id, usuario_id, credential_id, public_key, counter, created_at)
-       VALUES (UUID(), ?, ?, ?, 0, NOW())`,
-      [req.usuario.id, credential.id, JSON.stringify(credential)]
-    );
-
-    challenges.delete(req.usuario.id);
-
-    res.json({ mensaje: 'Biometría registrada correctamente' });
-  } catch (error) {
-    console.error('WebAuthn register error:', error);
-    res.status(500).json({ error: 'Error registrando credencial' });
-  }
-});
-
-// POST /api/auth/webauthn/login-options
-router.post('/webauthn/login-options', async (req, res) => {
-  try {
-    const { correo } = req.body;
-
-    // Buscar usuario y sus credenciales
     const [usuarios] = await db.query(
-      'SELECT id FROM usuarios WHERE correo = ?',
+      'SELECT * FROM usuarios WHERE correo = ?',
       [correo]
     );
 
     if (!usuarios.length) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
+      return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    const [credentials] = await db.query(
-      'SELECT credential_id FROM webauthn_credentials WHERE usuario_id = ?',
-      [usuarios[0].id]
-    );
+    const usuario = usuarios[0];
+    const valid = await bcrypt.compare(contrasena, usuario.contrasena);
 
-    if (!credentials.length) {
-      return res.status(404).json({ error: 'No hay biometría configurada' });
+    if (!valid) {
+      return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    const challenge = crypto.randomBytes(32).toString('base64url');
-    challenges.set(correo, { challenge, expires: Date.now() + 300000 });
-
-    const options = {
-      challenge,
-      timeout: 60000,
-      rpId: 'diegoleonuniline.github.io',
-      userVerification: 'required',
-      allowCredentials: credentials.map(c => ({
-        id: c.credential_id,
-        type: 'public-key',
-        transports: ['internal']
-      }))
-    };
-
-    res.json(options);
-  } catch (error) {
-    console.error('WebAuthn login options error:', error);
-    res.status(500).json({ error: 'Error generando opciones' });
-  }
-});
-
-// POST /api/auth/webauthn/login
-router.post('/webauthn/login', async (req, res) => {
-  try {
-    const { correo, credential } = req.body;
-    const stored = challenges.get(correo);
-
-    if (!stored || Date.now() > stored.expires) {
-      return res.status(400).json({ error: 'Challenge expirado' });
-    }
-
-    // Buscar credencial
-    const [creds] = await db.query(
-      `SELECT wc.*, u.id as usuario_id, u.nombre, u.apellido, u.correo, u.rol
-       FROM webauthn_credentials wc
-       JOIN usuarios u ON u.id = wc.usuario_id
-       WHERE wc.credential_id = ? AND u.correo = ?`,
-      [credential.id, correo]
-    );
-
-    if (!creds.length) {
-      return res.status(401).json({ error: 'Credencial no válida' });
-    }
-
-    // Actualizar contador
-    await db.query(
-      'UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?',
-      [credential.id]
-    );
-
-    challenges.delete(correo);
-
-    // Generar token
     const token = jwt.sign(
-      { id: creds[0].usuario_id, correo: creds[0].correo },
+      { id: usuario.id, correo: usuario.correo },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -155,212 +47,81 @@ router.post('/webauthn/login', async (req, res) => {
     res.json({
       token,
       usuario: {
-        id: creds[0].usuario_id,
-        nombre: creds[0].nombre,
-        apellido: creds[0].apellido,
-        correo: creds[0].correo,
-        rol: creds[0].rol
+        id: usuario.id,
+        nombre: usuario.nombre,
+        apellido: usuario.apellido,
+        correo: usuario.correo,
+        rol: usuario.rol
       }
     });
   } catch (error) {
-    console.error('WebAuthn login error:', error);
-    res.status(500).json({ error: 'Error de autenticación' });
-  }
-});
-const crypto = require('crypto');
-
-// Almacén temporal de challenges
-const challenges = new Map();
-
-// POST /api/auth/webauthn/register-options
-router.post('/webauthn/register-options', auth, async (req, res) => {
-  try {
-    const challenge = crypto.randomBytes(32).toString('base64url');
-    
-    challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
-
-    const options = {
-      challenge,
-      rp: {
-        name: 'TRUNO',
-        id: req.headers.host.split(':')[0] // dominio dinámico
-      },
-      user: {
-        id: Buffer.from(req.usuario.id).toString('base64url'),
-        name: req.usuario.correo,
-        displayName: `${req.usuario.nombre || ''} ${req.usuario.apellido || ''}`.trim()
-      },
-      pubKeyCredParams: [
-        { alg: -7, type: 'public-key' },
-        { alg: -257, type: 'public-key' }
-      ],
-      timeout: 60000,
-      attestation: 'none',
-      authenticatorSelection: {
-        authenticatorAttachment: 'platform',
-        userVerification: 'required',
-        residentKey: 'preferred'
-      }
-    };
-
-    res.json(options);
-  } catch (error) {
-    console.error('WebAuthn register options error:', error);
-    res.status(500).json({ error: 'Error generando opciones' });
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// POST /api/auth/webauthn/register
-router.post('/webauthn/register', auth, async (req, res) => {
+// POST /api/auth/register
+router.post('/register', async (req, res) => {
   try {
-    const { credential, dispositivo } = req.body;
-    const stored = challenges.get(req.usuario.id);
+    const { nombre, apellido, correo, contrasena } = req.body;
 
-    if (!stored || Date.now() > stored.expires) {
-      return res.status(400).json({ error: 'Sesión expirada, intenta de nuevo' });
+    if (!correo || !contrasena) {
+      return res.status(400).json({ error: 'Correo y contraseña son requeridos' });
     }
 
-    // Verificar si ya existe
-    const [existing] = await db.query(
-      'SELECT id FROM webauthn_credentials WHERE credential_id = ?',
-      [credential.id]
-    );
-
+    const [existing] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
     if (existing.length) {
-      return res.status(400).json({ error: 'Este dispositivo ya está registrado' });
+      return res.status(400).json({ error: 'El correo ya está registrado' });
     }
 
-    // Guardar credencial
+    const hash = await bcrypt.hash(contrasena, 10);
+    const id = require('uuid').v4();
+
     await db.query(
-      `INSERT INTO webauthn_credentials (id, usuario_id, credential_id, public_key, dispositivo)
-       VALUES (UUID(), ?, ?, ?, ?)`,
-      [req.usuario.id, credential.id, JSON.stringify(credential), dispositivo || 'Dispositivo']
+      'INSERT INTO usuarios (id, nombre, apellido, correo, contrasena) VALUES (?, ?, ?, ?, ?)',
+      [id, nombre, apellido, correo, hash]
     );
 
-    challenges.delete(req.usuario.id);
+    const token = jwt.sign(
+      { id, correo },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
-    res.json({ mensaje: 'Biometría registrada correctamente' });
+    res.status(201).json({
+      token,
+      usuario: { id, nombre, apellido, correo, rol: 'usuario' }
+    });
   } catch (error) {
-    console.error('WebAuthn register error:', error);
-    res.status(500).json({ error: 'Error registrando credencial' });
+    console.error('Register error:', error);
+    res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// GET /api/auth/webauthn/credentials
-router.get('/webauthn/credentials', auth, async (req, res) => {
+// GET /api/auth/me
+router.get('/me', auth, async (req, res) => {
   try {
-    const [credentials] = await db.query(
-      'SELECT id, dispositivo, created_at FROM webauthn_credentials WHERE usuario_id = ? ORDER BY created_at DESC',
+    const [usuarios] = await db.query(
+      'SELECT id, nombre, apellido, correo, rol FROM usuarios WHERE id = ?',
       [req.usuario.id]
     );
-    res.json({ credentials });
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error obteniendo credenciales' });
-  }
-});
 
-// DELETE /api/auth/webauthn/credentials/:id
-router.delete('/webauthn/credentials/:id', auth, async (req, res) => {
-  try {
-    await db.query(
-      'DELETE FROM webauthn_credentials WHERE id = ? AND usuario_id = ?',
-      [req.params.id, req.usuario.id]
-    );
-    res.json({ mensaje: 'Credencial eliminada' });
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error eliminando credencial' });
-  }
-});
-
-// POST /api/auth/webauthn/login-options
-router.post('/webauthn/login-options', async (req, res) => {
-  try {
-    const { correo } = req.body;
-
-    const [usuarios] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
     if (!usuarios.length) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    const [credentials] = await db.query(
-      'SELECT credential_id FROM webauthn_credentials WHERE usuario_id = ?',
-      [usuarios[0].id]
-    );
-
-    if (!credentials.length) {
-      return res.status(404).json({ error: 'No hay biometría configurada para este usuario' });
-    }
-
-    const challenge = crypto.randomBytes(32).toString('base64url');
-    challenges.set(correo, { challenge, expires: Date.now() + 300000, odUsuar: usuarios[0].id });
-
-    res.json({
-      challenge,
-      timeout: 60000,
-      rpId: req.headers.host.split(':')[0],
-      userVerification: 'required',
-      allowCredentials: credentials.map(c => ({
-        id: c.credential_id,
-        type: 'public-key',
-        transports: ['internal']
-      }))
-    });
+    res.json({ usuario: usuarios[0] });
   } catch (error) {
     console.error('Error:', error);
-    res.status(500).json({ error: 'Error generando opciones' });
+    res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// POST /api/auth/webauthn/login
-router.post('/webauthn/login', async (req, res) => {
-  try {
-    const { correo, credential } = req.body;
-    const stored = challenges.get(correo);
+// ========================================
+// PERFIL
+// ========================================
 
-    if (!stored || Date.now() > stored.expires) {
-      return res.status(400).json({ error: 'Sesión expirada' });
-    }
-
-    const [creds] = await db.query(
-      `SELECT wc.*, u.id as usuario_id, u.nombre, u.apellido, u.correo, u.rol
-       FROM webauthn_credentials wc
-       JOIN usuarios u ON u.id = wc.usuario_id
-       WHERE wc.credential_id = ? AND u.correo = ?`,
-      [credential.id, correo]
-    );
-
-    if (!creds.length) {
-      return res.status(401).json({ error: 'Credencial no válida' });
-    }
-
-    await db.query('UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?', [credential.id]);
-    challenges.delete(correo);
-
-    const token = jwt.sign(
-      { id: creds[0].usuario_id, correo: creds[0].correo },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.json({
-      token,
-      usuario: {
-        id: creds[0].usuario_id,
-        nombre: creds[0].nombre,
-        apellido: creds[0].apellido,
-        correo: creds[0].correo,
-        rol: creds[0].rol
-      }
-    });
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error de autenticación' });
-  }
-});
-
-// PUT /api/auth/perfil - Actualizar perfil
+// PUT /api/auth/perfil
 router.put('/perfil', auth, async (req, res) => {
   try {
     const { nombre, apellido } = req.body;
@@ -382,8 +143,16 @@ router.put('/cambiar-password', auth, async (req, res) => {
   try {
     const { password_actual, password_nuevo } = req.body;
 
+    if (!password_actual || !password_nuevo) {
+      return res.status(400).json({ error: 'Ambas contraseñas son requeridas' });
+    }
+
     const [usuarios] = await db.query('SELECT contrasena FROM usuarios WHERE id = ?', [req.usuario.id]);
     
+    if (!usuarios.length) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
     const valid = await bcrypt.compare(password_actual, usuarios[0].contrasena);
     if (!valid) {
       return res.status(400).json({ error: 'Contraseña actual incorrecta' });
@@ -398,3 +167,230 @@ router.put('/cambiar-password', auth, async (req, res) => {
     res.status(500).json({ error: 'Error cambiando contraseña' });
   }
 });
+
+// ========================================
+// WEBAUTHN / BIOMETRÍA
+// ========================================
+
+// POST /api/auth/webauthn/register-options
+router.post('/webauthn/register-options', auth, async (req, res) => {
+  try {
+    const challenge = crypto.randomBytes(32).toString('base64url');
+    
+    challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
+
+    // Obtener dominio del request
+    let rpId = req.headers.host || 'localhost';
+    rpId = rpId.split(':')[0]; // Quitar puerto si existe
+
+    const options = {
+      challenge,
+      rp: {
+        name: 'TRUNO',
+        id: rpId
+      },
+      user: {
+        id: Buffer.from(req.usuario.id).toString('base64url'),
+        name: req.usuario.correo,
+        displayName: `${req.usuario.nombre || ''} ${req.usuario.apellido || ''}`.trim() || req.usuario.correo
+      },
+      pubKeyCredParams: [
+        { alg: -7, type: 'public-key' },
+        { alg: -257, type: 'public-key' }
+      ],
+      timeout: 60000,
+      attestation: 'none',
+      authenticatorSelection: {
+        authenticatorAttachment: 'platform',
+        userVerification: 'required',
+        residentKey: 'preferred'
+      }
+    };
+
+    console.log('📱 WebAuthn register options generadas para:', req.usuario.correo);
+    res.json(options);
+  } catch (error) {
+    console.error('❌ WebAuthn register options error:', error);
+    res.status(500).json({ error: 'Error generando opciones' });
+  }
+});
+
+// POST /api/auth/webauthn/register
+router.post('/webauthn/register', auth, async (req, res) => {
+  try {
+    const { credential, dispositivo } = req.body;
+    
+    if (!credential || !credential.id) {
+      return res.status(400).json({ error: 'Credencial inválida' });
+    }
+
+    const stored = challenges.get(req.usuario.id);
+
+    if (!stored || Date.now() > stored.expires) {
+      return res.status(400).json({ error: 'Sesión expirada, intenta de nuevo' });
+    }
+
+    // Verificar si ya existe
+    const [existing] = await db.query(
+      'SELECT id FROM webauthn_credentials WHERE credential_id = ?',
+      [credential.id]
+    );
+
+    if (existing.length) {
+      return res.status(400).json({ error: 'Este dispositivo ya está registrado' });
+    }
+
+    // Guardar credencial
+    const { v4: uuidv4 } = require('uuid');
+    await db.query(
+      `INSERT INTO webauthn_credentials (id, usuario_id, credential_id, public_key, dispositivo)
+       VALUES (?, ?, ?, ?, ?)`,
+      [uuidv4(), req.usuario.id, credential.id, JSON.stringify(credential), dispositivo || 'Dispositivo']
+    );
+
+    challenges.delete(req.usuario.id);
+
+    console.log('✅ WebAuthn credencial registrada para:', req.usuario.correo);
+    res.json({ mensaje: 'Biometría registrada correctamente' });
+  } catch (error) {
+    console.error('❌ WebAuthn register error:', error);
+    res.status(500).json({ error: 'Error registrando credencial' });
+  }
+});
+
+// GET /api/auth/webauthn/credentials
+router.get('/webauthn/credentials', auth, async (req, res) => {
+  try {
+    const [credentials] = await db.query(
+      'SELECT id, dispositivo, created_at FROM webauthn_credentials WHERE usuario_id = ? ORDER BY created_at DESC',
+      [req.usuario.id]
+    );
+    res.json({ credentials });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Error obteniendo credenciales' });
+  }
+});
+
+// DELETE /api/auth/webauthn/credentials/:id
+router.delete('/webauthn/credentials/:id', auth, async (req, res) => {
+  try {
+    const [result] = await db.query(
+      'DELETE FROM webauthn_credentials WHERE id = ? AND usuario_id = ?',
+      [req.params.id, req.usuario.id]
+    );
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Credencial no encontrada' });
+    }
+
+    res.json({ mensaje: 'Credencial eliminada' });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Error eliminando credencial' });
+  }
+});
+
+// POST /api/auth/webauthn/login-options
+router.post('/webauthn/login-options', async (req, res) => {
+  try {
+    const { correo } = req.body;
+
+    if (!correo) {
+      return res.status(400).json({ error: 'Correo requerido' });
+    }
+
+    const [usuarios] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
+    if (!usuarios.length) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const [credentials] = await db.query(
+      'SELECT credential_id FROM webauthn_credentials WHERE usuario_id = ?',
+      [usuarios[0].id]
+    );
+
+    if (!credentials.length) {
+      return res.status(404).json({ error: 'No hay biometría configurada para este usuario' });
+    }
+
+    const challenge = crypto.randomBytes(32).toString('base64url');
+    challenges.set(correo, { challenge, expires: Date.now() + 300000, usuarioId: usuarios[0].id });
+
+    // Obtener dominio
+    let rpId = req.headers.host || 'localhost';
+    rpId = rpId.split(':')[0];
+
+    res.json({
+      challenge,
+      timeout: 60000,
+      rpId,
+      userVerification: 'required',
+      allowCredentials: credentials.map(c => ({
+        id: c.credential_id,
+        type: 'public-key',
+        transports: ['internal']
+      }))
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Error generando opciones' });
+  }
+});
+
+// POST /api/auth/webauthn/login
+router.post('/webauthn/login', async (req, res) => {
+  try {
+    const { correo, credential } = req.body;
+
+    if (!correo || !credential) {
+      return res.status(400).json({ error: 'Datos incompletos' });
+    }
+
+    const stored = challenges.get(correo);
+
+    if (!stored || Date.now() > stored.expires) {
+      return res.status(400).json({ error: 'Sesión expirada' });
+    }
+
+    const [creds] = await db.query(
+      `SELECT wc.*, u.id as usuario_id, u.nombre, u.apellido, u.correo, u.rol
+       FROM webauthn_credentials wc
+       JOIN usuarios u ON u.id = wc.usuario_id
+       WHERE wc.credential_id = ? AND u.correo = ?`,
+      [credential.id, correo]
+    );
+
+    if (!creds.length) {
+      return res.status(401).json({ error: 'Credencial no válida' });
+    }
+
+    // Actualizar contador
+    await db.query('UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?', [credential.id]);
+    challenges.delete(correo);
+
+    const token = jwt.sign(
+      { id: creds[0].usuario_id, correo: creds[0].correo },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    console.log('✅ WebAuthn login exitoso para:', correo);
+
+    res.json({
+      token,
+      usuario: {
+        id: creds[0].usuario_id,
+        nombre: creds[0].nombre,
+        apellido: creds[0].apellido,
+        correo: creds[0].correo,
+        rol: creds[0].rol
+      }
+    });
+  } catch (error) {
+    console.error('❌ WebAuthn login error:', error);
+    res.status(500).json({ error: 'Error de autenticación' });
+  }
+});
+
+module.exports = router;
