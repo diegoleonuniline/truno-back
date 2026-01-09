@@ -104,9 +104,10 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
-// GET /api/auth/me
+// GET /api/auth/me - Obtener usuario actual + organizaciones
 router.get('/me', auth, async (req, res, next) => {
   try {
+    // Obtener usuario
     const [usuarios] = await db.query(
       'SELECT id, nombre, apellido, correo, telefono FROM usuarios WHERE id = ? AND activo = 1',
       [req.usuario.id]
@@ -116,7 +117,21 @@ router.get('/me', auth, async (req, res, next) => {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    res.json({ usuario: usuarios[0] });
+    // Obtener organizaciones del usuario
+    const [organizaciones] = await db.query(
+      `SELECT o.id, o.nombre, o.tipo, o.rfc, o.correo, o.telefono, o.url_logo, 
+              uo.rol, o.creado_en
+       FROM organizaciones o
+       INNER JOIN usuario_organizaciones uo ON uo.organizacion_id = o.id
+       WHERE uo.usuario_id = ? AND o.activo = 1
+       ORDER BY o.nombre`,
+      [req.usuario.id]
+    );
+
+    res.json({ 
+      usuario: usuarios[0],
+      organizaciones: organizaciones || []
+    });
   } catch (error) {
     next(error);
   }
@@ -190,7 +205,6 @@ router.post('/webauthn/register-options', auth, async (req, res, next) => {
   try {
     const challenge = crypto.randomBytes(32).toString('base64url');
     
-    // Guardar challenge temporalmente (5 min)
     challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
 
     const options = {
@@ -239,7 +253,6 @@ router.post('/webauthn/register', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Sesión expirada, intenta de nuevo' });
     }
 
-    // Verificar si ya existe
     const [existing] = await db.query(
       'SELECT id FROM webauthn_credentials WHERE credential_id = ?',
       [credential.id]
@@ -249,7 +262,6 @@ router.post('/webauthn/register', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Este dispositivo ya está registrado' });
     }
 
-    // Guardar credencial
     await db.query(
       `INSERT INTO webauthn_credentials (id, usuario_id, credential_id, public_key, dispositivo)
        VALUES (?, ?, ?, ?, ?)`,
@@ -369,7 +381,6 @@ router.post('/webauthn/login', async (req, res, next) => {
       return res.status(401).json({ error: 'Credencial no válida' });
     }
 
-    // Actualizar contador y último acceso
     await db.query(
       'UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?', 
       [credential.id]
