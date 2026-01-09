@@ -40,6 +40,11 @@ app.use('/api/categorias', require('./routes/categorias.routes'));
 app.use('/api/impuestos', require('./routes/impuestos.routes'));
 app.use('/api/reportes', require('./routes/reportes.routes'));
 
+// Catálogos
+app.use('/api/subcategorias', require('./routes/subcategorias.routes'));
+app.use('/api/metodos-pago', require('./routes/metodosPago.routes'));
+app.use('/api/monedas', require('./routes/monedas.routes'));
+
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
