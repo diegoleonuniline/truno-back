@@ -7,6 +7,9 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 
+// IMPORTANTE: Para Heroku/proxies
+app.set('trust proxy', 1);
+
 // Middlewares de seguridad
 app.use(helmet());
 app.use(cors({
