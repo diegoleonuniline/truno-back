@@ -1,12 +1,12 @@
-const express = require('express');
-const router = express.Router();
+const router = require('express').Router();
+const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const db = require('../config/db');
-const { auth } = require('../middleware/auth');
+const db = require('../config/database');
+const { auth } = require('../middlewares/auth.middleware');
 
-// Almacén temporal de challenges (en producción usar Redis)
+// Almacén temporal de challenges
 const challenges = new Map();
 
 // ========================================
@@ -14,7 +14,7 @@ const challenges = new Map();
 // ========================================
 
 // POST /api/auth/login
-router.post('/login', async (req, res) => {
+router.post('/login', async (req, res, next) => {
   try {
     const { correo, contrasena } = req.body;
 
@@ -55,13 +55,12 @@ router.post('/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Error del servidor' });
+    next(error);
   }
 });
 
 // POST /api/auth/register
-router.post('/register', async (req, res) => {
+router.post('/register', async (req, res, next) => {
   try {
     const { nombre, apellido, correo, contrasena } = req.body;
 
@@ -75,7 +74,7 @@ router.post('/register', async (req, res) => {
     }
 
     const hash = await bcrypt.hash(contrasena, 10);
-    const id = require('uuid').v4();
+    const id = uuidv4();
 
     await db.query(
       'INSERT INTO usuarios (id, nombre, apellido, correo, contrasena) VALUES (?, ?, ?, ?, ?)',
@@ -93,13 +92,12 @@ router.post('/register', async (req, res) => {
       usuario: { id, nombre, apellido, correo, rol: 'usuario' }
     });
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ error: 'Error del servidor' });
+    next(error);
   }
 });
 
 // GET /api/auth/me
-router.get('/me', auth, async (req, res) => {
+router.get('/me', auth, async (req, res, next) => {
   try {
     const [usuarios] = await db.query(
       'SELECT id, nombre, apellido, correo, rol FROM usuarios WHERE id = ?',
@@ -112,8 +110,7 @@ router.get('/me', auth, async (req, res) => {
 
     res.json({ usuario: usuarios[0] });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error del servidor' });
+    next(error);
   }
 });
 
@@ -122,7 +119,7 @@ router.get('/me', auth, async (req, res) => {
 // ========================================
 
 // PUT /api/auth/perfil
-router.put('/perfil', auth, async (req, res) => {
+router.put('/perfil', auth, async (req, res, next) => {
   try {
     const { nombre, apellido } = req.body;
     
@@ -133,13 +130,12 @@ router.put('/perfil', auth, async (req, res) => {
 
     res.json({ mensaje: 'Perfil actualizado' });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error actualizando perfil' });
+    next(error);
   }
 });
 
 // PUT /api/auth/cambiar-password
-router.put('/cambiar-password', auth, async (req, res) => {
+router.put('/cambiar-password', auth, async (req, res, next) => {
   try {
     const { password_actual, password_nuevo } = req.body;
 
@@ -163,8 +159,7 @@ router.put('/cambiar-password', auth, async (req, res) => {
 
     res.json({ mensaje: 'Contraseña actualizada' });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error cambiando contraseña' });
+    next(error);
   }
 });
 
@@ -173,15 +168,14 @@ router.put('/cambiar-password', auth, async (req, res) => {
 // ========================================
 
 // POST /api/auth/webauthn/register-options
-router.post('/webauthn/register-options', auth, async (req, res) => {
+router.post('/webauthn/register-options', auth, async (req, res, next) => {
   try {
     const challenge = crypto.randomBytes(32).toString('base64url');
     
     challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
 
-    // Obtener dominio del request
-    let rpId = req.headers.host || 'localhost';
-    rpId = rpId.split(':')[0]; // Quitar puerto si existe
+    // Dominio fijo para GitHub Pages
+    const rpId = 'diegoleonuniline.github.io';
 
     const options = {
       challenge,
@@ -207,16 +201,15 @@ router.post('/webauthn/register-options', auth, async (req, res) => {
       }
     };
 
-    console.log('📱 WebAuthn register options generadas para:', req.usuario.correo);
+    console.log('📱 WebAuthn register options para:', req.usuario.correo);
     res.json(options);
   } catch (error) {
-    console.error('❌ WebAuthn register options error:', error);
-    res.status(500).json({ error: 'Error generando opciones' });
+    next(error);
   }
 });
 
 // POST /api/auth/webauthn/register
-router.post('/webauthn/register', auth, async (req, res) => {
+router.post('/webauthn/register', auth, async (req, res, next) => {
   try {
     const { credential, dispositivo } = req.body;
     
@@ -241,7 +234,6 @@ router.post('/webauthn/register', auth, async (req, res) => {
     }
 
     // Guardar credencial
-    const { v4: uuidv4 } = require('uuid');
     await db.query(
       `INSERT INTO webauthn_credentials (id, usuario_id, credential_id, public_key, dispositivo)
        VALUES (?, ?, ?, ?, ?)`,
@@ -250,16 +242,15 @@ router.post('/webauthn/register', auth, async (req, res) => {
 
     challenges.delete(req.usuario.id);
 
-    console.log('✅ WebAuthn credencial registrada para:', req.usuario.correo);
+    console.log('✅ WebAuthn registrado para:', req.usuario.correo);
     res.json({ mensaje: 'Biometría registrada correctamente' });
   } catch (error) {
-    console.error('❌ WebAuthn register error:', error);
-    res.status(500).json({ error: 'Error registrando credencial' });
+    next(error);
   }
 });
 
 // GET /api/auth/webauthn/credentials
-router.get('/webauthn/credentials', auth, async (req, res) => {
+router.get('/webauthn/credentials', auth, async (req, res, next) => {
   try {
     const [credentials] = await db.query(
       'SELECT id, dispositivo, created_at FROM webauthn_credentials WHERE usuario_id = ? ORDER BY created_at DESC',
@@ -267,13 +258,12 @@ router.get('/webauthn/credentials', auth, async (req, res) => {
     );
     res.json({ credentials });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error obteniendo credenciales' });
+    next(error);
   }
 });
 
 // DELETE /api/auth/webauthn/credentials/:id
-router.delete('/webauthn/credentials/:id', auth, async (req, res) => {
+router.delete('/webauthn/credentials/:id', auth, async (req, res, next) => {
   try {
     const [result] = await db.query(
       'DELETE FROM webauthn_credentials WHERE id = ? AND usuario_id = ?',
@@ -286,13 +276,12 @@ router.delete('/webauthn/credentials/:id', auth, async (req, res) => {
 
     res.json({ mensaje: 'Credencial eliminada' });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error eliminando credencial' });
+    next(error);
   }
 });
 
 // POST /api/auth/webauthn/login-options
-router.post('/webauthn/login-options', async (req, res) => {
+router.post('/webauthn/login-options', async (req, res, next) => {
   try {
     const { correo } = req.body;
 
@@ -317,9 +306,8 @@ router.post('/webauthn/login-options', async (req, res) => {
     const challenge = crypto.randomBytes(32).toString('base64url');
     challenges.set(correo, { challenge, expires: Date.now() + 300000, usuarioId: usuarios[0].id });
 
-    // Obtener dominio
-    let rpId = req.headers.host || 'localhost';
-    rpId = rpId.split(':')[0];
+    // Dominio fijo
+    const rpId = 'diegoleonuniline.github.io';
 
     res.json({
       challenge,
@@ -333,13 +321,12 @@ router.post('/webauthn/login-options', async (req, res) => {
       }))
     });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error generando opciones' });
+    next(error);
   }
 });
 
 // POST /api/auth/webauthn/login
-router.post('/webauthn/login', async (req, res) => {
+router.post('/webauthn/login', async (req, res, next) => {
   try {
     const { correo, credential } = req.body;
 
@@ -375,7 +362,7 @@ router.post('/webauthn/login', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    console.log('✅ WebAuthn login exitoso para:', correo);
+    console.log('✅ WebAuthn login exitoso:', correo);
 
     res.json({
       token,
@@ -388,8 +375,7 @@ router.post('/webauthn/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ WebAuthn login error:', error);
-    res.status(500).json({ error: 'Error de autenticación' });
+    next(error);
   }
 });
 
