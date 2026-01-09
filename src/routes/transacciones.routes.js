@@ -363,5 +363,175 @@ router.delete('/:id', auth, requireOrg, async (req, res, next) => {
     next(error);
   }
 });
+// POST /api/transacciones/transferencia
+router.post('/transferencia', auth, requireOrg, async (req, res, next) => {
+  try {
+    console.log('🔄 ========== POST /api/transacciones/transferencia ==========');
+    
+    const { cuenta_origen_id, cuenta_destino_id, monto, fecha, descripcion, referencia } = req.body;
 
+    if (!cuenta_origen_id || !cuenta_destino_id || !monto || !fecha) {
+      return res.status(400).json({ error: 'Faltan datos requeridos' });
+    }
+
+    if (cuenta_origen_id === cuenta_destino_id) {
+      return res.status(400).json({ error: 'Las cuentas deben ser diferentes' });
+    }
+
+    const montoNum = parseFloat(monto);
+    if (montoNum <= 0) {
+      return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+    }
+
+    // Verificar saldo de cuenta origen
+    const [cuentaOrigen] = await db.query(
+      'SELECT saldo_actual FROM cuentas_bancarias WHERE id = ? AND organizacion_id = ?',
+      [cuenta_origen_id, req.organizacion.id]
+    );
+
+    if (!cuentaOrigen.length) {
+      return res.status(404).json({ error: 'Cuenta origen no encontrada' });
+    }
+
+    const saldoOrigen = parseFloat(cuentaOrigen[0].saldo_actual) || 0;
+    if (montoNum > saldoOrigen) {
+      return res.status(400).json({ error: 'Saldo insuficiente en cuenta origen' });
+    }
+
+    // Verificar cuenta destino existe
+    const [cuentaDestino] = await db.query(
+      'SELECT saldo_actual FROM cuentas_bancarias WHERE id = ? AND organizacion_id = ?',
+      [cuenta_destino_id, req.organizacion.id]
+    );
+
+    if (!cuentaDestino.length) {
+      return res.status(404).json({ error: 'Cuenta destino no encontrada' });
+    }
+
+    const saldoDestino = parseFloat(cuentaDestino[0].saldo_actual) || 0;
+
+    // Crear IDs
+    const egresoId = uuidv4();
+    const ingresoId = uuidv4();
+    const desc = descripcion || 'Transferencia entre cuentas';
+
+    // Crear egreso (cuenta origen)
+    await db.query(
+      `INSERT INTO transacciones 
+       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia, 
+        es_transferencia_interna, id_par_transferencia, saldo_despues, creado_por)
+       VALUES (?, ?, ?, 'egreso', ?, ?, ?, ?, 1, ?, ?, ?)`,
+      [egresoId, req.organizacion.id, cuenta_origen_id, montoNum, fecha, desc, referencia || null,
+       ingresoId, saldoOrigen - montoNum, req.usuario.id]
+    );
+
+    // Crear ingreso (cuenta destino)
+    await db.query(
+      `INSERT INTO transacciones 
+       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia,
+        es_transferencia_interna, id_par_transferencia, saldo_despues, creado_por)
+       VALUES (?, ?, ?, 'ingreso', ?, ?, ?, ?, 1, ?, ?, ?)`,
+      [ingresoId, req.organizacion.id, cuenta_destino_id, montoNum, fecha, desc, referencia || null,
+       egresoId, saldoDestino + montoNum, req.usuario.id]
+    );
+
+    // Actualizar saldos de cuentas
+    await db.query(
+      'UPDATE cuentas_bancarias SET saldo_actual = saldo_actual - ? WHERE id = ?',
+      [montoNum, cuenta_origen_id]
+    );
+
+    await db.query(
+      'UPDATE cuentas_bancarias SET saldo_actual = saldo_actual + ? WHERE id = ?',
+      [montoNum, cuenta_destino_id]
+    );
+
+    console.log('✅ Transferencia creada:', { egresoId, ingresoId, monto: montoNum });
+
+    res.status(201).json({ 
+      mensaje: 'Transferencia realizada',
+      egreso_id: egresoId,
+      ingreso_id: ingresoId
+    });
+  } catch (error) {
+    console.error('❌ Error en transferencia:', error);
+    next(error);
+  }
+});
+
+// DELETE /api/transacciones/transferencia/:id
+router.delete('/transferencia/:id', auth, requireOrg, async (req, res, next) => {
+  try {
+    console.log('🗑️ ========== DELETE /api/transacciones/transferencia/:id ==========');
+
+    // Obtener la transacción y su par
+    const [transaccion] = await db.query(
+      `SELECT t.*, c.saldo_actual 
+       FROM transacciones t
+       JOIN cuentas_bancarias c ON c.id = t.cuenta_bancaria_id
+       WHERE t.id = ? AND t.organizacion_id = ? AND t.es_transferencia_interna = 1`,
+      [req.params.id, req.organizacion.id]
+    );
+
+    if (!transaccion.length) {
+      return res.status(404).json({ error: 'Transferencia no encontrada' });
+    }
+
+    const tx = transaccion[0];
+    const parId = tx.id_par_transferencia;
+
+    // Obtener transacción par
+    const [parTx] = await db.query(
+      `SELECT t.*, c.saldo_actual 
+       FROM transacciones t
+       JOIN cuentas_bancarias c ON c.id = t.cuenta_bancaria_id
+       WHERE t.id = ? AND t.organizacion_id = ?`,
+      [parId, req.organizacion.id]
+    );
+
+    const monto = parseFloat(tx.monto) || 0;
+
+    // Revertir saldos según el tipo
+    if (tx.tipo === 'egreso') {
+      // Devolver a cuenta origen
+      await db.query(
+        'UPDATE cuentas_bancarias SET saldo_actual = saldo_actual + ? WHERE id = ?',
+        [monto, tx.cuenta_bancaria_id]
+      );
+      // Quitar de cuenta destino
+      if (parTx.length) {
+        await db.query(
+          'UPDATE cuentas_bancarias SET saldo_actual = saldo_actual - ? WHERE id = ?',
+          [monto, parTx[0].cuenta_bancaria_id]
+        );
+      }
+    } else {
+      // Devolver a cuenta origen (par es el egreso)
+      if (parTx.length) {
+        await db.query(
+          'UPDATE cuentas_bancarias SET saldo_actual = saldo_actual + ? WHERE id = ?',
+          [monto, parTx[0].cuenta_bancaria_id]
+        );
+      }
+      // Quitar de cuenta destino
+      await db.query(
+        'UPDATE cuentas_bancarias SET saldo_actual = saldo_actual - ? WHERE id = ?',
+        [monto, tx.cuenta_bancaria_id]
+      );
+    }
+
+    // Eliminar ambas transacciones
+    await db.query('DELETE FROM transacciones WHERE id = ?', [req.params.id]);
+    if (parId) {
+      await db.query('DELETE FROM transacciones WHERE id = ?', [parId]);
+    }
+
+    console.log('✅ Transferencia eliminada:', req.params.id);
+
+    res.json({ mensaje: 'Transferencia eliminada' });
+  } catch (error) {
+    console.error('❌ Error eliminando transferencia:', error);
+    next(error);
+  }
+});
 module.exports = router;
