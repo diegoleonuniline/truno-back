@@ -226,8 +226,9 @@ router.post('/webauthn/register-options', auth, async (req, res, next) => {
       attestation: 'none',
       authenticatorSelection: {
         authenticatorAttachment: 'platform',
-        userVerification: 'required',
-        residentKey: 'preferred'
+        userVerification: 'preferred',  // Cambiado de 'required' a 'preferred'
+        residentKey: 'required',         // Cambiado a 'required' para passkeys
+        requireResidentKey: true         // Passkeys guardadas en el dispositivo
       }
     };
 
