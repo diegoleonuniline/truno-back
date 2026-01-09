@@ -13,7 +13,7 @@ const auth = async (req, res, next) => {
     
     const [usuarios] = await db.query(
       'SELECT id, correo, nombre, apellido, activo FROM usuarios WHERE id = ?',
-      [decoded.usuarioId]
+   [decoded.id]
     );
 
     if (!usuarios.length || !usuarios[0].activo) {
