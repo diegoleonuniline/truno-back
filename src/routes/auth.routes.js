@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const db = require('../config/database');
 const { auth } = require('../middlewares/auth.middleware');
 
-// Almacén temporal de challenges
+// Almacén temporal de challenges para WebAuthn
 const challenges = new Map();
 
 // ========================================
@@ -23,7 +23,7 @@ router.post('/login', async (req, res, next) => {
     }
 
     const [usuarios] = await db.query(
-      'SELECT * FROM usuarios WHERE correo = ?',
+      'SELECT * FROM usuarios WHERE correo = ? AND activo = 1',
       [correo]
     );
 
@@ -32,11 +32,14 @@ router.post('/login', async (req, res, next) => {
     }
 
     const usuario = usuarios[0];
-    const valid = await bcrypt.compare(contrasena, usuario.contrasena);
+    const valid = await bcrypt.compare(contrasena, usuario.contrasena_hash);
 
     if (!valid) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
+
+    // Actualizar último acceso
+    await db.query('UPDATE usuarios SET ultimo_acceso = NOW() WHERE id = ?', [usuario.id]);
 
     const token = jwt.sign(
       { id: usuario.id, correo: usuario.correo },
@@ -51,7 +54,7 @@ router.post('/login', async (req, res, next) => {
         nombre: usuario.nombre,
         apellido: usuario.apellido,
         correo: usuario.correo,
-        rol: usuario.rol
+        telefono: usuario.telefono
       }
     });
   } catch (error) {
@@ -62,10 +65,14 @@ router.post('/login', async (req, res, next) => {
 // POST /api/auth/register
 router.post('/register', async (req, res, next) => {
   try {
-    const { nombre, apellido, correo, contrasena } = req.body;
+    const { nombre, apellido, correo, contrasena, telefono } = req.body;
 
-    if (!correo || !contrasena) {
-      return res.status(400).json({ error: 'Correo y contraseña son requeridos' });
+    if (!nombre || !correo || !contrasena) {
+      return res.status(400).json({ error: 'Nombre, correo y contraseña son requeridos' });
+    }
+
+    if (contrasena.length < 8) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
     }
 
     const [existing] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
@@ -77,8 +84,9 @@ router.post('/register', async (req, res, next) => {
     const id = uuidv4();
 
     await db.query(
-      'INSERT INTO usuarios (id, nombre, apellido, correo, contrasena) VALUES (?, ?, ?, ?, ?)',
-      [id, nombre, apellido, correo, hash]
+      `INSERT INTO usuarios (id, nombre, apellido, correo, contrasena_hash, telefono) 
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, nombre, apellido || null, correo, hash, telefono || null]
     );
 
     const token = jwt.sign(
@@ -89,7 +97,7 @@ router.post('/register', async (req, res, next) => {
 
     res.status(201).json({
       token,
-      usuario: { id, nombre, apellido, correo, rol: 'usuario' }
+      usuario: { id, nombre, apellido, correo, telefono }
     });
   } catch (error) {
     next(error);
@@ -100,7 +108,7 @@ router.post('/register', async (req, res, next) => {
 router.get('/me', auth, async (req, res, next) => {
   try {
     const [usuarios] = await db.query(
-      'SELECT id, nombre, apellido, correo, rol FROM usuarios WHERE id = ?',
+      'SELECT id, nombre, apellido, correo, telefono FROM usuarios WHERE id = ? AND activo = 1',
       [req.usuario.id]
     );
 
@@ -121,11 +129,11 @@ router.get('/me', auth, async (req, res, next) => {
 // PUT /api/auth/perfil
 router.put('/perfil', auth, async (req, res, next) => {
   try {
-    const { nombre, apellido } = req.body;
+    const { nombre, apellido, telefono } = req.body;
     
     await db.query(
-      'UPDATE usuarios SET nombre = ?, apellido = ? WHERE id = ?',
-      [nombre, apellido, req.usuario.id]
+      'UPDATE usuarios SET nombre = COALESCE(?, nombre), apellido = ?, telefono = ? WHERE id = ?',
+      [nombre, apellido || null, telefono || null, req.usuario.id]
     );
 
     res.json({ mensaje: 'Perfil actualizado' });
@@ -143,19 +151,29 @@ router.put('/cambiar-password', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Ambas contraseñas son requeridas' });
     }
 
-    const [usuarios] = await db.query('SELECT contrasena FROM usuarios WHERE id = ?', [req.usuario.id]);
+    if (password_nuevo.length < 8) {
+      return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 8 caracteres' });
+    }
+
+    const [usuarios] = await db.query(
+      'SELECT contrasena_hash FROM usuarios WHERE id = ?', 
+      [req.usuario.id]
+    );
     
     if (!usuarios.length) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    const valid = await bcrypt.compare(password_actual, usuarios[0].contrasena);
+    const valid = await bcrypt.compare(password_actual, usuarios[0].contrasena_hash);
     if (!valid) {
       return res.status(400).json({ error: 'Contraseña actual incorrecta' });
     }
 
     const hash = await bcrypt.hash(password_nuevo, 10);
-    await db.query('UPDATE usuarios SET contrasena = ? WHERE id = ?', [hash, req.usuario.id]);
+    await db.query(
+      'UPDATE usuarios SET contrasena_hash = ? WHERE id = ?', 
+      [hash, req.usuario.id]
+    );
 
     res.json({ mensaje: 'Contraseña actualizada' });
   } catch (error) {
@@ -164,7 +182,7 @@ router.put('/cambiar-password', auth, async (req, res, next) => {
 });
 
 // ========================================
-// WEBAUTHN / BIOMETRÍA
+// WEBAUTHN / BIOMETRÍA (Face ID / Touch ID)
 // ========================================
 
 // POST /api/auth/webauthn/register-options
@@ -172,16 +190,14 @@ router.post('/webauthn/register-options', auth, async (req, res, next) => {
   try {
     const challenge = crypto.randomBytes(32).toString('base64url');
     
+    // Guardar challenge temporalmente (5 min)
     challenges.set(req.usuario.id, { challenge, expires: Date.now() + 300000 });
-
-    // Dominio fijo para GitHub Pages
-    const rpId = 'diegoleonuniline.github.io';
 
     const options = {
       challenge,
       rp: {
         name: 'TRUNO',
-        id: rpId
+        id: 'diegoleonuniline.github.io'
       },
       user: {
         id: Buffer.from(req.usuario.id).toString('base64url'),
@@ -201,7 +217,7 @@ router.post('/webauthn/register-options', auth, async (req, res, next) => {
       }
     };
 
-    console.log('📱 WebAuthn register options para:', req.usuario.correo);
+    console.log('📱 WebAuthn register-options para:', req.usuario.correo);
     res.json(options);
   } catch (error) {
     next(error);
@@ -289,7 +305,11 @@ router.post('/webauthn/login-options', async (req, res, next) => {
       return res.status(400).json({ error: 'Correo requerido' });
     }
 
-    const [usuarios] = await db.query('SELECT id FROM usuarios WHERE correo = ?', [correo]);
+    const [usuarios] = await db.query(
+      'SELECT id FROM usuarios WHERE correo = ? AND activo = 1', 
+      [correo]
+    );
+    
     if (!usuarios.length) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
@@ -306,13 +326,10 @@ router.post('/webauthn/login-options', async (req, res, next) => {
     const challenge = crypto.randomBytes(32).toString('base64url');
     challenges.set(correo, { challenge, expires: Date.now() + 300000, usuarioId: usuarios[0].id });
 
-    // Dominio fijo
-    const rpId = 'diegoleonuniline.github.io';
-
     res.json({
       challenge,
       timeout: 60000,
-      rpId,
+      rpId: 'diegoleonuniline.github.io',
       userVerification: 'required',
       allowCredentials: credentials.map(c => ({
         id: c.credential_id,
@@ -341,10 +358,10 @@ router.post('/webauthn/login', async (req, res, next) => {
     }
 
     const [creds] = await db.query(
-      `SELECT wc.*, u.id as usuario_id, u.nombre, u.apellido, u.correo, u.rol
+      `SELECT wc.*, u.id as usuario_id, u.nombre, u.apellido, u.correo, u.telefono
        FROM webauthn_credentials wc
        JOIN usuarios u ON u.id = wc.usuario_id
-       WHERE wc.credential_id = ? AND u.correo = ?`,
+       WHERE wc.credential_id = ? AND u.correo = ? AND u.activo = 1`,
       [credential.id, correo]
     );
 
@@ -352,8 +369,16 @@ router.post('/webauthn/login', async (req, res, next) => {
       return res.status(401).json({ error: 'Credencial no válida' });
     }
 
-    // Actualizar contador
-    await db.query('UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?', [credential.id]);
+    // Actualizar contador y último acceso
+    await db.query(
+      'UPDATE webauthn_credentials SET counter = counter + 1 WHERE credential_id = ?', 
+      [credential.id]
+    );
+    await db.query(
+      'UPDATE usuarios SET ultimo_acceso = NOW() WHERE id = ?', 
+      [creds[0].usuario_id]
+    );
+    
     challenges.delete(correo);
 
     const token = jwt.sign(
@@ -371,7 +396,7 @@ router.post('/webauthn/login', async (req, res, next) => {
         nombre: creds[0].nombre,
         apellido: creds[0].apellido,
         correo: creds[0].correo,
-        rol: creds[0].rol
+        telefono: creds[0].telefono
       }
     });
   } catch (error) {
