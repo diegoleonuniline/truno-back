@@ -5,6 +5,23 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 
+// Validar variables de entorno críticas al iniciar
+// Relacionado con: .env (configuración del servidor)
+if (!process.env.JWT_SECRET) {
+  console.error('❌ ERROR: JWT_SECRET no está definido en las variables de entorno');
+  console.error('   Por favor, agrega JWT_SECRET a tu archivo .env');
+  process.exit(1);
+}
+
+if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_NAME) {
+  console.error('❌ ERROR: Variables de base de datos faltantes en .env');
+  process.exit(1);
+}
+
+console.log('✅ Variables de entorno cargadas correctamente');
+console.log('   JWT_SECRET:', process.env.JWT_SECRET ? '✓ Configurado' : '✗ Faltante');
+console.log('   DB_HOST:', process.env.DB_HOST || '✗ Faltante');
+
 const app = express();
 
 // IMPORTANTE: Para Heroku/proxies
