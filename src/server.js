@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+onst plataformasRoutes = require('./routes/plataformas.routes');
 
 // Validar variables de entorno críticas al iniciar
 // Relacionado con: .env (configuración del servidor)
@@ -56,6 +57,7 @@ app.use('/api/gastos', require('./routes/gastos.routes'));
 app.use('/api/categorias', require('./routes/categorias.routes'));
 app.use('/api/impuestos', require('./routes/impuestos.routes'));
 app.use('/api/reportes', require('./routes/reportes.routes'));
+app.use('/api/plataformas', plataformasRoutes);
 
 // Catálogos
 app.use('/api/subcategorias', require('./routes/subcategorias.routes'));
