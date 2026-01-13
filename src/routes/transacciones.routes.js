@@ -88,22 +88,20 @@ router.get('/:id', auth, requireOrg, async (req, res, next) => {
 });
 
 // POST /api/transacciones
+// POST /api/transacciones - reemplaza el actual
 router.post('/', auth, requireOrg, async (req, res, next) => {
   try {
-    console.log('🆕 ========== POST /api/transacciones ==========');
-    console.log('📦 Body recibido:', JSON.stringify(req.body, null, 2));
-    
     const { 
       cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
       descripcion, referencia, comprobante_url,
-      gasto_id, venta_id
+      gasto_id, venta_id, metodo_pago, moneda,
+      // Nuevos campos comisión
+      plataforma_origen, monto_bruto, tipo_comision, comision_valor,
+      moneda_origen, tipo_cambio
     } = req.body;
 
-    console.log('🔗 gasto_id recibido:', gasto_id);
-    console.log('🔗 venta_id recibido:', venta_id);
-
-    if (!cuenta_bancaria_id || !tipo || !monto || !fecha) {
-      return res.status(400).json({ error: 'Cuenta, tipo, monto y fecha son requeridos' });
+    if (!cuenta_bancaria_id || !tipo || !fecha) {
+      return res.status(400).json({ error: 'Cuenta, tipo y fecha son requeridos' });
     }
 
     // Verificar cuenta
@@ -117,76 +115,77 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
     }
 
     const transaccionId = uuidv4();
-    const montoNum = parseFloat(monto);
+    
+    // Calcular monto neto si hay monto_bruto
+    let montoFinal;
+    if (monto_bruto && parseFloat(monto_bruto) > 0) {
+      const bruto = parseFloat(monto_bruto);
+      const tipoComision = tipo_comision || 'monto';
+      const valorComision = parseFloat(comision_valor) || 0;
+      const tc = parseFloat(tipo_cambio) || 1;
+      
+      let comisionCalculada = 0;
+      if (tipoComision === 'porcentaje') {
+        comisionCalculada = bruto * valorComision / 100;
+      } else {
+        comisionCalculada = valorComision;
+      }
+      
+      montoFinal = (bruto - comisionCalculada) * tc;
+    } else {
+      montoFinal = parseFloat(monto);
+    }
+
     const saldoActual = parseFloat(cuentas[0].saldo_actual);
-    const nuevoSaldo = tipo === 'ingreso' ? saldoActual + montoNum : saldoActual - montoNum;
+    const nuevoSaldo = tipo === 'ingreso' ? saldoActual + montoFinal : saldoActual - montoFinal;
 
     await db.query(
       `INSERT INTO transacciones 
        (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
         descripcion, referencia, comprobante_url, gasto_id, venta_id, 
-        saldo_despues, creado_por) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoNum, fecha,
-       contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
-       gasto_id || null, venta_id || null, nuevoSaldo, req.usuario.id]
+        metodo_pago, moneda, plataforma_origen, monto_bruto, tipo_comision, 
+        comision_valor, moneda_origen, tipo_cambio, saldo_despues, creado_por) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
+        contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
+        gasto_id || null, venta_id || null, metodo_pago || null, moneda || 'MXN',
+        plataforma_origen || null, monto_bruto || null, tipo_comision || 'monto',
+        comision_valor || 0, moneda_origen || 'MXN', tipo_cambio || 1,
+        nuevoSaldo, req.usuario.id
+      ]
     );
 
-    // Actualizar saldo cuenta
     await db.query('UPDATE cuentas_bancarias SET saldo_actual = ? WHERE id = ?', [nuevoSaldo, cuenta_bancaria_id]);
 
-    // ========== VINCULAR GASTO (bidireccional) ==========
+    // Vincular gasto/venta (código existente)
     if (gasto_id) {
-      console.log('🔗 Vinculando gasto:', gasto_id);
-      const [updateResult] = await db.query(
+      await db.query(
         'UPDATE gastos SET transaccion_id = ? WHERE id = ? AND organizacion_id = ?', 
         [transaccionId, gasto_id, req.organizacion.id]
       );
-      console.log('🔗 Resultado UPDATE gastos:', updateResult.affectedRows, 'filas afectadas');
     }
 
-    // ========== VINCULAR VENTA (bidireccional) + actualizar monto_cobrado ==========
     if (venta_id) {
-      console.log('🔗 Vinculando venta:', venta_id);
-      
-      // Obtener venta actual
       const [ventas] = await db.query(
-        'SELECT id, total, monto_cobrado, estatus_pago FROM ventas WHERE id = ? AND organizacion_id = ?',
+        'SELECT id, total, monto_cobrado FROM ventas WHERE id = ? AND organizacion_id = ?',
         [venta_id, req.organizacion.id]
       );
       
       if (ventas.length) {
         const venta = ventas[0];
         const totalVenta = parseFloat(venta.total) || 0;
-        const montoCobradoActual = parseFloat(venta.monto_cobrado) || 0;
-        const nuevoMontoCobrado = montoCobradoActual + montoNum;
+        const nuevoMontoCobrado = (parseFloat(venta.monto_cobrado) || 0) + montoFinal;
+        let nuevoEstatus = nuevoMontoCobrado >= totalVenta ? 'pagado' : nuevoMontoCobrado > 0 ? 'parcial' : 'pendiente';
         
-        // Determinar nuevo estatus
-        let nuevoEstatus = 'pendiente';
-        if (nuevoMontoCobrado >= totalVenta) {
-          nuevoEstatus = 'pagado';
-        } else if (nuevoMontoCobrado > 0) {
-          nuevoEstatus = 'parcial';
-        }
-        
-        console.log('💰 Venta - Total:', totalVenta, 'Cobrado anterior:', montoCobradoActual, 'Nuevo cobrado:', nuevoMontoCobrado, 'Estatus:', nuevoEstatus);
-        
-        // Actualizar venta con monto_cobrado, estatus y transaccion_id
-        const [updateResult] = await db.query(
-          `UPDATE ventas SET 
-           transaccion_id = ?, 
-           monto_cobrado = ?, 
-           estatus_pago = ?
-           WHERE id = ? AND organizacion_id = ?`,
-          [transaccionId, nuevoMontoCobrado, nuevoEstatus, venta_id, req.organizacion.id]
+        await db.query(
+          `UPDATE ventas SET transaccion_id = ?, monto_cobrado = ?, estatus_pago = ? WHERE id = ?`,
+          [transaccionId, nuevoMontoCobrado, nuevoEstatus, venta_id]
         );
-        console.log('🔗 Resultado UPDATE ventas:', updateResult.affectedRows, 'filas afectadas');
-      } else {
-        console.log('⚠️ Venta no encontrada:', venta_id);
       }
     }
 
-    res.status(201).json({ id: transaccionId, transaccion: { id: transaccionId, saldo_despues: nuevoSaldo } });
+    res.status(201).json({ id: transaccionId, transaccion: { id: transaccionId, monto: montoFinal, saldo_despues: nuevoSaldo } });
   } catch (error) {
     next(error);
   }
