@@ -4,7 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-onst plataformasRoutes = require('./routes/plataformas.routes');
+const plataformasRoutes = require('./routes/plataformas.routes');
 
 // Validar variables de entorno críticas al iniciar
 // Relacionado con: .env (configuración del servidor)
