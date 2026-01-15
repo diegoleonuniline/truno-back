@@ -119,11 +119,11 @@ router.get('/me', auth, async (req, res, next) => {
 
     // Obtener organizaciones del usuario
     const [organizaciones] = await db.query(
-      `SELECT o.id, o.nombre, o.tipo, o.rfc, o.correo, o.telefono, o.url_logo, 
+      `SELECT o.id, o.nombre, o.tipo, o.rfc, o.correo, o.telefono, o.url_logo, o.activo,
               uo.rol, o.creado_en
        FROM organizaciones o
        INNER JOIN usuario_organizaciones uo ON uo.organizacion_id = o.id
-       WHERE uo.usuario_id = ? AND o.activo = 1
+       WHERE uo.usuario_id = ?
        ORDER BY o.nombre`,
       [req.usuario.id]
     );

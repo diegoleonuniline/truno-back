@@ -121,6 +121,49 @@ router.put('/:id', auth, requireOrg, requireRole('propietario', 'administrador')
   }
 });
 
+/**
+ * PUT /api/organizaciones/:id/estado
+ * Dar de baja / reactivar una empresa.
+ *
+ * Requisito de negocio:
+ * - “Vista donde pueda ver todas mis empresas, agregar, dar de baja, editar nombre”.
+ *
+ * Nota importante:
+ * - Este endpoint asume que la tabla `organizaciones` tiene una columna `activo` (TINYINT/BOOLEAN).
+ * - Si tu BD todavía no la tiene, regresamos 501 para no romper el servidor.
+ */
+router.put('/:id/estado', auth, requireOrg, requireRole('propietario', 'administrador'), async (req, res, next) => {
+  try {
+    const { activo } = req.body;
+    if (activo === undefined) {
+      return res.status(400).json({ error: 'Campo "activo" es requerido (true/false o 1/0)' });
+    }
+
+    try {
+      const [result] = await db.query(
+        'UPDATE organizaciones SET activo = ? WHERE id = ?',
+        [activo === true || activo === 1 || activo === '1', req.params.id]
+      );
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: 'Organización no encontrada' });
+      }
+
+      res.json({ mensaje: (activo === true || activo === 1 || activo === '1') ? 'Organización reactivada' : 'Organización dada de baja' });
+    } catch (err) {
+      // Compatibilidad con BD sin columna `activo`
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        return res.status(501).json({
+          error: 'Tu base de datos no soporta dar de baja organizaciones (falta columna organizaciones.activo)'
+        });
+      }
+      throw err;
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
 // GET /api/organizaciones/:id/miembros
 router.get('/:id/miembros', auth, requireOrg, async (req, res, next) => {
   try {

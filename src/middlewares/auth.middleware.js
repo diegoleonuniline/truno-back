@@ -53,17 +53,30 @@ const requireOrg = async (req, res, next) => {
       return res.status(403).json({ error: 'Sin acceso a esta organización' });
     }
 
-    if (!userOrgs[0].org_activo) {
-      return res.status(403).json({ error: 'Organización inactiva' });
-    }
-
     req.organizacion = {
       id: orgId,
       nombre: userOrgs[0].org_nombre,
       rol: userOrgs[0].rol,
+      activo: !!userOrgs[0].org_activo,
       plan: userOrgs[0].nombre_plan || 'free',
       modulos: userOrgs[0].modulos ? JSON.parse(userOrgs[0].modulos) : ['bancos']
     };
+
+    // Si la organización está inactiva, solo permitir rutas administrativas para reactivarla/editarla.
+    // Relación:
+    // - truno-back/src/routes/organizaciones.routes.js -> PUT /api/organizaciones/:id y PUT /api/organizaciones/:id/estado
+    // - truno-front/organizaciones/seleccionar.js -> reactivar/editar empresas inactivas
+    if (!req.organizacion.activo) {
+      const isOrgAdminRoute = req.baseUrl === '/api/organizaciones';
+      const isAllowed =
+        isOrgAdminRoute &&
+        req.method === 'PUT' &&
+        (req.path === `/${orgId}` || req.path === `/${orgId}/estado`);
+
+      if (!isAllowed) {
+        return res.status(403).json({ error: 'Organización inactiva' });
+      }
+    }
 
     next();
   } catch (error) {

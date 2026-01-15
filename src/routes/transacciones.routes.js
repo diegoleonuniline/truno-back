@@ -94,14 +94,22 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
     const { 
       cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
       descripcion, referencia, comprobante_url,
-      gasto_id, venta_id, metodo_pago, moneda,
-      // Nuevos campos comisión
-      plataforma_origen, monto_bruto, tipo_comision, comision_valor,
-      moneda_origen, tipo_cambio
+      moneda, metodo_pago,
+      plataforma_origen, monto_bruto, moneda_origen, tipo_comision, comision_valor, tipo_cambio,
+      gasto_id, venta_id
     } = req.body;
 
     if (!cuenta_bancaria_id || !tipo || !fecha) {
       return res.status(400).json({ error: 'Cuenta, tipo y fecha son requeridos' });
+    }
+
+    const montoNum = (monto !== undefined && monto !== null && monto !== '') ? parseFloat(monto) : null;
+    const montoBrutoNum = (monto_bruto !== undefined && monto_bruto !== null && monto_bruto !== '') ? parseFloat(monto_bruto) : null;
+    if (
+      (montoBrutoNum === null || Number.isNaN(montoBrutoNum) || montoBrutoNum <= 0) &&
+      (montoNum === null || Number.isNaN(montoNum))
+    ) {
+      return res.status(400).json({ error: 'Monto es requerido (monto o monto_bruto)' });
     }
 
     // Verificar cuenta
@@ -118,11 +126,15 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
     
     // Calcular monto neto si hay monto_bruto
     let montoFinal;
-    if (monto_bruto && parseFloat(monto_bruto) > 0) {
-      const bruto = parseFloat(monto_bruto);
+    if (montoBrutoNum !== null && !Number.isNaN(montoBrutoNum) && montoBrutoNum > 0) {
+      const bruto = montoBrutoNum;
       const tipoComision = tipo_comision || 'monto';
-      const valorComision = parseFloat(comision_valor) || 0;
-      const tc = parseFloat(tipo_cambio) || 1;
+      const valorComision = (comision_valor !== undefined && comision_valor !== null && comision_valor !== '')
+        ? (parseFloat(comision_valor) || 0)
+        : 0;
+      const tc = (tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '')
+        ? (parseFloat(tipo_cambio) || 1)
+        : 1;
       
       let comisionCalculada = 0;
       if (tipoComision === 'porcentaje') {
@@ -133,28 +145,56 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
       
       montoFinal = (bruto - comisionCalculada) * tc;
     } else {
-      montoFinal = parseFloat(monto);
+      montoFinal = montoNum;
+    }
+
+    if (!Number.isFinite(montoFinal)) {
+      return res.status(400).json({ error: 'Monto inválido' });
     }
 
     const saldoActual = parseFloat(cuentas[0].saldo_actual);
     const nuevoSaldo = tipo === 'ingreso' ? saldoActual + montoFinal : saldoActual - montoFinal;
 
-    await db.query(
-      `INSERT INTO transacciones 
-       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
-        descripcion, referencia, comprobante_url, gasto_id, venta_id, 
-        metodo_pago, moneda, plataforma_origen, monto_bruto, tipo_comision, 
-        comision_valor, moneda_origen, tipo_cambio, saldo_despues, creado_por) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
-        contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
-        gasto_id || null, venta_id || null, metodo_pago || null, moneda || 'MXN',
-        plataforma_origen || null, monto_bruto || null, tipo_comision || 'monto',
-        comision_valor || 0, moneda_origen || 'MXN', tipo_cambio || 1,
-        nuevoSaldo, req.usuario.id
-      ]
-    );
+    try {
+      await db.query(
+        `INSERT INTO transacciones 
+         (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
+          descripcion, referencia, comprobante_url,
+          gasto_id, venta_id,
+          metodo_pago, moneda, plataforma_origen, monto_bruto, tipo_comision, 
+          comision_valor, moneda_origen, tipo_cambio, saldo_despues, creado_por) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
+          contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
+          gasto_id || null, venta_id || null,
+          metodo_pago || null, moneda || 'MXN',
+          plataforma_origen || null,
+          (montoBrutoNum !== null && Number.isFinite(montoBrutoNum)) ? montoBrutoNum : null,
+          tipo_comision || 'monto',
+          (comision_valor !== undefined && comision_valor !== null && comision_valor !== '') ? (parseFloat(comision_valor) || 0) : 0,
+          moneda_origen || 'MXN',
+          (tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '') ? (parseFloat(tipo_cambio) || 1) : 1,
+          nuevoSaldo, req.usuario.id
+        ]
+      );
+    } catch (err) {
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        console.warn('⚠️ DB sin columnas extendidas de transacciones. Usando INSERT legacy. Detalle:', err.message);
+        await db.query(
+          `INSERT INTO transacciones 
+           (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
+            descripcion, referencia, comprobante_url, gasto_id, venta_id, 
+            saldo_despues, creado_por) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
+           contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
+           gasto_id || null, venta_id || null, nuevoSaldo, req.usuario.id]
+        );
+      } else {
+        throw err;
+      }
+    }
 
     await db.query('UPDATE cuentas_bancarias SET saldo_actual = ? WHERE id = ?', [nuevoSaldo, cuenta_bancaria_id]);
 
@@ -197,7 +237,12 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
     console.log('✏️ ========== PUT /api/transacciones/:id ==========');
     console.log('📦 Body recibido:', JSON.stringify(req.body, null, 2));
     
-    const { descripcion, referencia, comprobante_url, contacto_id, gasto_id, venta_id } = req.body;
+    const {
+      descripcion, referencia, comprobante_url, contacto_id, gasto_id, venta_id,
+      // Campos extendidos (no afectan saldo): permite corregir comisión/moneda/método sin tocar el monto contable
+      moneda, metodo_pago,
+      plataforma_origen, monto_bruto, moneda_origen, tipo_comision, comision_valor, tipo_cambio
+    } = req.body;
 
     // Obtener transacción actual
     const [txActual] = await db.query(
@@ -279,19 +324,60 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
     }
 
     // Actualizar transacción
-    const [result] = await db.query(
-      `UPDATE transacciones SET 
-       descripcion = COALESCE(?, descripcion),
-       referencia = ?,
-       comprobante_url = ?,
-       contacto_id = ?,
-       gasto_id = ?,
-       venta_id = ?
-       WHERE id = ? AND organizacion_id = ?`,
-      [descripcion, referencia || null, comprobante_url || null, 
-       contacto_id || null, newGastoId || null, newVentaId || null, 
-       req.params.id, req.organizacion.id]
-    );
+    let result;
+    try {
+      ([result] = await db.query(
+        `UPDATE transacciones SET 
+         descripcion = COALESCE(?, descripcion),
+         referencia = ?,
+         comprobante_url = ?,
+         contacto_id = ?,
+         moneda = COALESCE(?, moneda),
+         metodo_pago = ?,
+         plataforma_origen = ?,
+         monto_bruto = ?,
+         moneda_origen = ?,
+         tipo_comision = ?,
+         comision_valor = ?,
+         tipo_cambio = ?,
+         gasto_id = ?,
+         venta_id = ?
+         WHERE id = ? AND organizacion_id = ?`,
+        [
+          descripcion, referencia || null, comprobante_url || null,
+          contacto_id || null,
+          moneda || null,
+          metodo_pago || null,
+          plataforma_origen || null,
+          monto_bruto !== undefined && monto_bruto !== null && monto_bruto !== '' ? parseFloat(monto_bruto) : null,
+          moneda_origen || null,
+          tipo_comision || null,
+          comision_valor !== undefined && comision_valor !== null && comision_valor !== '' ? parseFloat(comision_valor) : null,
+          tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '' ? parseFloat(tipo_cambio) : null,
+          newGastoId || null, newVentaId || null,
+          req.params.id, req.organizacion.id
+        ]
+      ));
+    } catch (err) {
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        console.warn('⚠️ DB sin columnas extendidas en transacciones. Usando UPDATE legacy. Detalle:', err.message);
+        ([result] = await db.query(
+          `UPDATE transacciones SET 
+           descripcion = COALESCE(?, descripcion),
+           referencia = ?,
+           comprobante_url = ?,
+           contacto_id = ?,
+           gasto_id = ?,
+           venta_id = ?
+           WHERE id = ? AND organizacion_id = ?`,
+          [descripcion, referencia || null, comprobante_url || null,
+           contacto_id || null, newGastoId || null, newVentaId || null,
+           req.params.id, req.organizacion.id]
+        ));
+      } else {
+        throw err;
+      }
+    }
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: 'Transacción no encontrada' });
