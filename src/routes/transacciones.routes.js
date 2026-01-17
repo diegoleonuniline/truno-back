@@ -8,6 +8,10 @@ router.get('/', auth, requireOrg, async (req, res, next) => {
   try {
     const { 
       cuenta_bancaria_id, contacto_id, tipo, buscar, sin_conciliar, conciliado,
+      // Filtros adicionales:
+      // - excluir_transferencias=1 -> oculta transferencias internas en la vista de Transacciones
+      // - solo_transferencias=1 -> devuelve únicamente transferencias internas (útil para módulo Transferencias)
+      excluir_transferencias, solo_transferencias,
       pagina = 1, limite = 20 
     } = req.query;
 
@@ -37,6 +41,15 @@ router.get('/', auth, requireOrg, async (req, res, next) => {
     }
     if (conciliado === '1') {
       sql += ' AND (t.gasto_id IS NOT NULL OR t.venta_id IS NOT NULL)';
+    }
+    // Transferencias internas (misma tabla)
+    // Relacionado con:
+    // - truno-front/transacciones/transacciones.js (excluir_transferencias=1 para que el filtro "Estado" sea correcto)
+    // - truno-front/transferencias/transferencias.js (solo_transferencias=1 si se desea optimizar)
+    if (solo_transferencias === '1') {
+      sql += ' AND t.es_transferencia_interna = 1';
+    } else if (excluir_transferencias === '1') {
+      sql += ' AND (t.es_transferencia_interna IS NULL OR t.es_transferencia_interna = 0)';
     }
     if (buscar) {
       sql += ' AND (t.descripcion LIKE ? OR t.referencia LIKE ?)';
@@ -453,7 +466,7 @@ router.post('/transferencia', auth, requireOrg, async (req, res, next) => {
   try {
     console.log('🔄 ========== POST /api/transacciones/transferencia ==========');
     
-    const { cuenta_origen_id, cuenta_destino_id, monto, fecha, descripcion, referencia } = req.body;
+    const { cuenta_origen_id, cuenta_destino_id, monto, fecha, descripcion, referencia, estado_transferencia } = req.body;
 
     if (!cuenta_origen_id || !cuenta_destino_id || !monto || !fecha) {
       return res.status(400).json({ error: 'Faltan datos requeridos' });
@@ -467,6 +480,13 @@ router.post('/transferencia', auth, requireOrg, async (req, res, next) => {
     if (montoNum <= 0) {
       return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
     }
+
+    // Estado (tracking) de la transferencia
+    // Relacionado con: truno-front/transferencias/transferencias.js (columna Estado)
+    const allowedEstados = new Set(['recibido', 'en_transito', 'en_cuenta']);
+    const estadoFinal = allowedEstados.has(String(estado_transferencia || '').toLowerCase())
+      ? String(estado_transferencia).toLowerCase()
+      : 'en_cuenta';
 
     // Verificar saldo de cuenta origen
     const [cuentaOrigen] = await db.query(
@@ -501,24 +521,55 @@ router.post('/transferencia', auth, requireOrg, async (req, res, next) => {
     const desc = descripcion || 'Transferencia entre cuentas';
 
     // Crear egreso (cuenta origen)
-    await db.query(
-      `INSERT INTO transacciones 
-       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia, 
-        es_transferencia_interna, id_par_transferencia, saldo_despues, creado_por)
-       VALUES (?, ?, ?, 'egreso', ?, ?, ?, ?, 1, ?, ?, ?)`,
-      [egresoId, req.organizacion.id, cuenta_origen_id, montoNum, fecha, desc, referencia || null,
-       ingresoId, saldoOrigen - montoNum, req.usuario.id]
-    );
+    try {
+      await db.query(
+        `INSERT INTO transacciones 
+         (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia, 
+          es_transferencia_interna, id_par_transferencia, estado_transferencia, saldo_despues, creado_por)
+         VALUES (?, ?, ?, 'egreso', ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+        [egresoId, req.organizacion.id, cuenta_origen_id, montoNum, fecha, desc, referencia || null,
+         ingresoId, estadoFinal, saldoOrigen - montoNum, req.usuario.id]
+      );
+    } catch (err) {
+      // Compatibilidad: si la columna no existe aún
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        await db.query(
+          `INSERT INTO transacciones 
+           (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia, 
+            es_transferencia_interna, id_par_transferencia, saldo_despues, creado_por)
+           VALUES (?, ?, ?, 'egreso', ?, ?, ?, ?, 1, ?, ?, ?)`,
+          [egresoId, req.organizacion.id, cuenta_origen_id, montoNum, fecha, desc, referencia || null,
+           ingresoId, saldoOrigen - montoNum, req.usuario.id]
+        );
+      } else {
+        throw err;
+      }
+    }
 
     // Crear ingreso (cuenta destino)
-    await db.query(
-      `INSERT INTO transacciones 
-       (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia,
-        es_transferencia_interna, id_par_transferencia, saldo_despues, creado_por)
-       VALUES (?, ?, ?, 'ingreso', ?, ?, ?, ?, 1, ?, ?, ?)`,
-      [ingresoId, req.organizacion.id, cuenta_destino_id, montoNum, fecha, desc, referencia || null,
-       egresoId, saldoDestino + montoNum, req.usuario.id]
-    );
+    try {
+      await db.query(
+        `INSERT INTO transacciones 
+         (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia,
+          es_transferencia_interna, id_par_transferencia, estado_transferencia, saldo_despues, creado_por)
+         VALUES (?, ?, ?, 'ingreso', ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+        [ingresoId, req.organizacion.id, cuenta_destino_id, montoNum, fecha, desc, referencia || null,
+         egresoId, estadoFinal, saldoDestino + montoNum, req.usuario.id]
+      );
+    } catch (err) {
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        await db.query(
+          `INSERT INTO transacciones 
+           (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, descripcion, referencia,
+            es_transferencia_interna, id_par_transferencia, saldo_despues, creado_por)
+           VALUES (?, ?, ?, 'ingreso', ?, ?, ?, ?, 1, ?, ?, ?)`,
+          [ingresoId, req.organizacion.id, cuenta_destino_id, montoNum, fecha, desc, referencia || null,
+           egresoId, saldoDestino + montoNum, req.usuario.id]
+        );
+      } else {
+        throw err;
+      }
+    }
 
     // Actualizar saldos de cuentas
     await db.query(
@@ -619,4 +670,60 @@ router.delete('/transferencia/:id', auth, requireOrg, async (req, res, next) => 
     next(error);
   }
 });
+
+// PUT /api/transacciones/transferencia/:id/estado
+// Permite actualizar el estado de una transferencia (y su par) sin eliminar/crear movimientos.
+//
+// Importante:
+// - Este "estado_transferencia" es un metadato operativo (tracking) y NO cambia saldos.
+// - Relacionado con:
+//   - truno-front/transferencias/transferencias.js (select Estado en tabla)
+//   - truno-back/src/db/migrate.js (asegura columna transacciones.estado_transferencia)
+router.put('/transferencia/:id/estado', auth, requireOrg, async (req, res, next) => {
+  try {
+    const { estado_transferencia } = req.body;
+    const allowed = new Set(['recibido', 'en_transito', 'en_cuenta']);
+
+    if (!allowed.has(String(estado_transferencia || '').toLowerCase())) {
+      return res.status(400).json({ error: 'Estado inválido. Usa: recibido | en_transito | en_cuenta' });
+    }
+
+    // Obtener la transferencia y su par
+    const [rows] = await db.query(
+      `SELECT id, id_par_transferencia
+       FROM transacciones
+       WHERE id = ? AND organizacion_id = ? AND es_transferencia_interna = 1`,
+      [req.params.id, req.organizacion.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Transferencia no encontrada' });
+    }
+
+    const tx = rows[0];
+    const parId = tx.id_par_transferencia;
+
+    // Actualizar ambos registros (si existe el par)
+    try {
+      await db.query(
+        `UPDATE transacciones
+         SET estado_transferencia = ?
+         WHERE organizacion_id = ? AND id IN (?, ?)` ,
+        [estado_transferencia, req.organizacion.id, tx.id, parId || tx.id]
+      );
+    } catch (err) {
+      if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+        return res.status(500).json({
+          error: 'La base de datos no tiene la columna estado_transferencia. Ejecuta migración/ALTER TABLE.'
+        });
+      }
+      throw err;
+    }
+
+    res.json({ mensaje: 'Estado de transferencia actualizado', id: tx.id, estado_transferencia });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

@@ -5,6 +5,9 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const plataformasRoutes = require('./routes/plataformas.routes');
+// Migraciones ligeras (sin framework)
+// Relacionado con: truno-back/src/db/migrate.js
+const { ensureEstadoTransferenciaColumn } = require('./db/migrate');
 
 // Validar variables de entorno críticas al iniciar
 // Relacionado con: .env (configuración del servidor)
@@ -82,8 +85,23 @@ app.use((req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 TRUNO Backend corriendo en puerto ${PORT}`);
-});
+
+// Inicialización del servidor + migraciones
+// Relacionado con:
+// - truno-back/src/db/migrate.js (asegura columnas nuevas)
+// - truno-back/src/routes/transacciones.routes.js (usa estado_transferencia)
+(async function start() {
+  try {
+    await ensureEstadoTransferenciaColumn();
+  } catch (e) {
+    console.error('❌ Error ejecutando migraciones:', e?.message || e);
+    // No detenemos el servidor: en producción a veces no hay permisos de ALTER.
+    // En ese caso, las rutas que dependan de la columna deben manejar el error.
+  }
+
+  app.listen(PORT, () => {
+    console.log(`🚀 TRUNO Backend corriendo en puerto ${PORT}`);
+  });
+})();
 
 module.exports = app;
