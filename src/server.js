@@ -7,7 +7,7 @@ const rateLimit = require('express-rate-limit');
 const plataformasRoutes = require('./routes/plataformas.routes');
 // Migraciones ligeras (sin framework)
 // Relacionado con: truno-back/src/db/migrate.js
-const { ensureEstadoTransferenciaColumn } = require('./db/migrate');
+const { ensureEstadoTransferenciaColumn, ensureEstadoOperacionColumn } = require('./db/migrate');
 
 // Validar variables de entorno críticas al iniciar
 // Relacionado con: .env (configuración del servidor)
@@ -93,6 +93,7 @@ const PORT = process.env.PORT || 3000;
 (async function start() {
   try {
     await ensureEstadoTransferenciaColumn();
+    await ensureEstadoOperacionColumn();
   } catch (e) {
     console.error('❌ Error ejecutando migraciones:', e?.message || e);
     // No detenemos el servidor: en producción a veces no hay permisos de ALTER.

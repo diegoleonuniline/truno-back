@@ -80,7 +80,78 @@ async function ensureEstadoTransferenciaColumn() {
   console.log('✅ migrate: columna estado_transferencia creada y backfill aplicado.');
 }
 
+/**
+ * Asegura la columna `estado_operacion` en la tabla `transacciones`.
+ *
+ * Objetivo:
+ * - Dar tracking a INGRESOS (principalmente) con 3 estados operativos solicitados:
+ *   - en_transito | realizado | cancelado
+ *
+ * Relación:
+ * - truno-front/transacciones/index.html + transacciones.js (select de estado)
+ * - truno-front/transacciones/transacciones.js -> submitTx() envía `estado_operacion`
+ * - truno-back/src/routes/transacciones.routes.js (POST/PUT validan y guardan)
+ *
+ * Nota:
+ * - Se guarda normalizado (snake_case) en DB.
+ * - Default conservador: 'realizado' (no rompe instalaciones existentes).
+ */
+async function ensureEstadoOperacionColumn() {
+  const schema = process.env.DB_NAME;
+  if (!schema) {
+    console.warn('⚠️ migrate: DB_NAME no definido. Se omite migración de estado_operacion.');
+    return;
+  }
+
+  // 1) Verificar que exista la tabla
+  const [[{ table_count }]] = await db.query(
+    `SELECT COUNT(*) AS table_count
+     FROM information_schema.tables
+     WHERE table_schema = ? AND table_name = 'transacciones'`,
+    [schema]
+  );
+
+  if (!table_count) {
+    console.warn('⚠️ migrate: tabla "transacciones" no existe. Se omite migración de estado_operacion.');
+    return;
+  }
+
+  // 2) Verificar si ya existe la columna
+  const [[{ col_count }]] = await db.query(
+    `SELECT COUNT(*) AS col_count
+     FROM information_schema.columns
+     WHERE table_schema = ? AND table_name = 'transacciones' AND column_name = 'estado_operacion'`,
+    [schema]
+  );
+
+  if (col_count) return; // ya existe
+
+  console.log('🧩 migrate: agregando columna transacciones.estado_operacion...');
+
+  // 3) Agregar columna inicialmente NULL
+  await db.query(
+    `ALTER TABLE transacciones
+     ADD COLUMN estado_operacion VARCHAR(20) NULL`
+  );
+
+  // 4) Backfill conservador
+  await db.query(
+    `UPDATE transacciones
+     SET estado_operacion = 'realizado'
+     WHERE estado_operacion IS NULL`
+  );
+
+  // 5) Setear default y NOT NULL para nuevas filas
+  await db.query(
+    `ALTER TABLE transacciones
+     MODIFY COLUMN estado_operacion VARCHAR(20) NOT NULL DEFAULT 'realizado'`
+  );
+
+  console.log('✅ migrate: columna estado_operacion creada y backfill aplicado.');
+}
+
 module.exports = {
-  ensureEstadoTransferenciaColumn
+  ensureEstadoTransferenciaColumn,
+  ensureEstadoOperacionColumn
 };
 

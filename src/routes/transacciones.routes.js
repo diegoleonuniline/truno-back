@@ -109,7 +109,14 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
       descripcion, referencia, comprobante_url,
       moneda, metodo_pago,
       plataforma_origen, monto_bruto, moneda_origen, tipo_comision, comision_valor, tipo_cambio,
-      gasto_id, venta_id
+      gasto_id, venta_id,
+      // Estado operativo (tracking) - solicitado por negocio
+      // Valores normalizados:
+      // - en_transito | realizado | cancelado
+      // Relación:
+      // - truno-front/transacciones/index.html (#estadoOperacion)
+      // - truno-front/transacciones/transacciones.js -> submitTx() envía estado_operacion (solo ingresos)
+      estado_operacion
     } = req.body;
 
     if (!cuenta_bancaria_id || !tipo || !fecha) {
@@ -168,6 +175,17 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
     const saldoActual = parseFloat(cuentas[0].saldo_actual);
     const nuevoSaldo = tipo === 'ingreso' ? saldoActual + montoFinal : saldoActual - montoFinal;
 
+    // Estado operativo:
+    // - Por regla de negocio, solo se usa para ingresos.
+    // - Default: realizado.
+    // - Se valida para evitar valores arbitrarios.
+    const allowedEstadosOperacion = new Set(['en_transito', 'realizado', 'cancelado']);
+    let estadoOperacionFinal = 'realizado';
+    if (tipo === 'ingreso') {
+      const raw = String(estado_operacion || '').toLowerCase().trim();
+      if (allowedEstadosOperacion.has(raw)) estadoOperacionFinal = raw;
+    }
+
     try {
       await db.query(
         `INSERT INTO transacciones 
@@ -175,8 +193,10 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
           descripcion, referencia, comprobante_url,
           gasto_id, venta_id,
           metodo_pago, moneda, plataforma_origen, monto_bruto, tipo_comision, 
-          comision_valor, moneda_origen, tipo_cambio, saldo_despues, creado_por) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          comision_valor, moneda_origen, tipo_cambio,
+          estado_operacion,
+          saldo_despues, creado_por) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
           contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
@@ -188,22 +208,56 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
           (comision_valor !== undefined && comision_valor !== null && comision_valor !== '') ? (parseFloat(comision_valor) || 0) : 0,
           moneda_origen || 'MXN',
           (tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '') ? (parseFloat(tipo_cambio) || 1) : 1,
+          estadoOperacionFinal,
           nuevoSaldo, req.usuario.id
         ]
       );
     } catch (err) {
       if (err && err.code === 'ER_BAD_FIELD_ERROR') {
-        console.warn('⚠️ DB sin columnas extendidas de transacciones. Usando INSERT legacy. Detalle:', err.message);
-        await db.query(
-          `INSERT INTO transacciones 
-           (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
-            descripcion, referencia, comprobante_url, gasto_id, venta_id, 
-            saldo_despues, creado_por) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
-           contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
-           gasto_id || null, venta_id || null, nuevoSaldo, req.usuario.id]
-        );
+        // Compatibilidad:
+        // 1) Si falta SOLO la columna estado_operacion, intentar INSERT extendido sin ella
+        // 2) Si faltan más columnas, caer al INSERT legacy
+        console.warn('⚠️ DB sin alguna columna extendida en transacciones. Intentando fallback. Detalle:', err.message);
+        try {
+          await db.query(
+            `INSERT INTO transacciones 
+             (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
+              descripcion, referencia, comprobante_url,
+              gasto_id, venta_id,
+              metodo_pago, moneda, plataforma_origen, monto_bruto, tipo_comision, 
+              comision_valor, moneda_origen, tipo_cambio, saldo_despues, creado_por) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
+              contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
+              gasto_id || null, venta_id || null,
+              metodo_pago || null, moneda || 'MXN',
+              plataforma_origen || null,
+              (montoBrutoNum !== null && Number.isFinite(montoBrutoNum)) ? montoBrutoNum : null,
+              tipo_comision || 'monto',
+              (comision_valor !== undefined && comision_valor !== null && comision_valor !== '') ? (parseFloat(comision_valor) || 0) : 0,
+              moneda_origen || 'MXN',
+              (tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '') ? (parseFloat(tipo_cambio) || 1) : 1,
+              nuevoSaldo, req.usuario.id
+            ]
+          );
+        } catch (err2) {
+          if (err2 && err2.code === 'ER_BAD_FIELD_ERROR') {
+            console.warn('⚠️ DB sin columnas extendidas de transacciones. Usando INSERT legacy. Detalle:', err2.message);
+            await db.query(
+              `INSERT INTO transacciones 
+               (id, organizacion_id, cuenta_bancaria_id, tipo, monto, fecha, contacto_id,
+                descripcion, referencia, comprobante_url, gasto_id, venta_id, 
+                saldo_despues, creado_por) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [transaccionId, req.organizacion.id, cuenta_bancaria_id, tipo, montoFinal, fecha,
+               contacto_id || null, descripcion || null, referencia || null, comprobante_url || null,
+               gasto_id || null, venta_id || null, nuevoSaldo, req.usuario.id]
+            );
+          } else {
+            throw err2;
+          }
+        }
       } else {
         throw err;
       }
@@ -254,7 +308,10 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
       descripcion, referencia, comprobante_url, contacto_id, gasto_id, venta_id,
       // Campos extendidos (no afectan saldo): permite corregir comisión/moneda/método sin tocar el monto contable
       moneda, metodo_pago,
-      plataforma_origen, monto_bruto, moneda_origen, tipo_comision, comision_valor, tipo_cambio
+      plataforma_origen, monto_bruto, moneda_origen, tipo_comision, comision_valor, tipo_cambio,
+      // Estado operativo (tracking) - solicitado por negocio
+      // Nota: en backend solo aplicamos a ingresos.
+      estado_operacion
     } = req.body;
 
     // Obtener transacción actual
@@ -338,6 +395,12 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
 
     // Actualizar transacción
     let result;
+    // Estado operativo:
+    // - Solo para ingresos
+    // - Si viene un valor inválido, lo ignoramos (no rompemos el update)
+    const allowedEstadosOperacion = new Set(['en_transito', 'realizado', 'cancelado']);
+    const rawEstadoOp = String(estado_operacion || '').toLowerCase().trim();
+    const estadoOperacionToSave = (tx.tipo === 'ingreso' && allowedEstadosOperacion.has(rawEstadoOp)) ? rawEstadoOp : null;
     try {
       ([result] = await db.query(
         `UPDATE transacciones SET 
@@ -353,6 +416,7 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
          tipo_comision = ?,
          comision_valor = ?,
          tipo_cambio = ?,
+         estado_operacion = COALESCE(?, estado_operacion),
          gasto_id = ?,
          venta_id = ?
          WHERE id = ? AND organizacion_id = ?`,
@@ -367,26 +431,70 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
           tipo_comision || null,
           comision_valor !== undefined && comision_valor !== null && comision_valor !== '' ? parseFloat(comision_valor) : null,
           tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '' ? parseFloat(tipo_cambio) : null,
+          estadoOperacionToSave,
           newGastoId || null, newVentaId || null,
           req.params.id, req.organizacion.id
         ]
       ));
     } catch (err) {
       if (err && err.code === 'ER_BAD_FIELD_ERROR') {
-        console.warn('⚠️ DB sin columnas extendidas en transacciones. Usando UPDATE legacy. Detalle:', err.message);
-        ([result] = await db.query(
-          `UPDATE transacciones SET 
-           descripcion = COALESCE(?, descripcion),
-           referencia = ?,
-           comprobante_url = ?,
-           contacto_id = ?,
-           gasto_id = ?,
-           venta_id = ?
-           WHERE id = ? AND organizacion_id = ?`,
-          [descripcion, referencia || null, comprobante_url || null,
-           contacto_id || null, newGastoId || null, newVentaId || null,
-           req.params.id, req.organizacion.id]
-        ));
+        // Compatibilidad:
+        // 1) Intentar UPDATE extendido sin estado_operacion (por si solo falta esa columna)
+        // 2) Si siguen faltando columnas, caer al UPDATE legacy
+        console.warn('⚠️ DB sin alguna columna extendida en transacciones. Intentando fallback. Detalle:', err.message);
+        try {
+          ([result] = await db.query(
+            `UPDATE transacciones SET 
+             descripcion = COALESCE(?, descripcion),
+             referencia = ?,
+             comprobante_url = ?,
+             contacto_id = ?,
+             moneda = COALESCE(?, moneda),
+             metodo_pago = ?,
+             plataforma_origen = ?,
+             monto_bruto = ?,
+             moneda_origen = ?,
+             tipo_comision = ?,
+             comision_valor = ?,
+             tipo_cambio = ?,
+             gasto_id = ?,
+             venta_id = ?
+             WHERE id = ? AND organizacion_id = ?`,
+            [
+              descripcion, referencia || null, comprobante_url || null,
+              contacto_id || null,
+              moneda || null,
+              metodo_pago || null,
+              plataforma_origen || null,
+              monto_bruto !== undefined && monto_bruto !== null && monto_bruto !== '' ? parseFloat(monto_bruto) : null,
+              moneda_origen || null,
+              tipo_comision || null,
+              comision_valor !== undefined && comision_valor !== null && comision_valor !== '' ? parseFloat(comision_valor) : null,
+              tipo_cambio !== undefined && tipo_cambio !== null && tipo_cambio !== '' ? parseFloat(tipo_cambio) : null,
+              newGastoId || null, newVentaId || null,
+              req.params.id, req.organizacion.id
+            ]
+          ));
+        } catch (err2) {
+          if (err2 && err2.code === 'ER_BAD_FIELD_ERROR') {
+            console.warn('⚠️ DB sin columnas extendidas en transacciones. Usando UPDATE legacy. Detalle:', err2.message);
+            ([result] = await db.query(
+              `UPDATE transacciones SET 
+               descripcion = COALESCE(?, descripcion),
+               referencia = ?,
+               comprobante_url = ?,
+               contacto_id = ?,
+               gasto_id = ?,
+               venta_id = ?
+               WHERE id = ? AND organizacion_id = ?`,
+              [descripcion, referencia || null, comprobante_url || null,
+               contacto_id || null, newGastoId || null, newVentaId || null,
+               req.params.id, req.organizacion.id]
+            ));
+          } else {
+            throw err2;
+          }
+        }
       } else {
         throw err;
       }
