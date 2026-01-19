@@ -322,7 +322,16 @@ router.post('/', auth, requireOrg, async (req, res, next) => {
       if (ventas.length) {
         const venta = ventas[0];
         const totalVenta = parseFloat(venta.total) || 0;
-        const nuevoMontoCobrado = (parseFloat(venta.monto_cobrado) || 0) + montoFinal;
+        // ✅ Negocio (Ventas):
+        // La venta debe reflejar lo cobrado SIN descontar comisiones.
+        // Ej: venta=1000, banco recibe 800 (fee 200) => monto_cobrado debe sumar 1000.
+        // Relación:
+        // - truno-front/transacciones: comisiones guardan `monto_bruto`
+        // - saldo bancario usa `montoFinal` (neto) para NO inflar el banco
+        const montoParaVenta = (montoBrutoNum !== null && Number.isFinite(montoBrutoNum) && montoBrutoNum > 0)
+          ? montoBrutoNum
+          : montoFinal;
+        const nuevoMontoCobrado = (parseFloat(venta.monto_cobrado) || 0) + montoParaVenta;
         let nuevoEstatus = nuevoMontoCobrado >= totalVenta ? 'pagado' : nuevoMontoCobrado > 0 ? 'parcial' : 'pendiente';
         
         await db.query(
@@ -366,6 +375,12 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
 
     const tx = txActual[0];
     const montoNum = parseFloat(tx.monto) || 0;
+    // ✅ Negocio (Ventas):
+    // Para actualizar monto_cobrado de ventas, usar monto_bruto si existe (sin comisión).
+    // Mantener `montoNum` (neto) para lógica bancaria/otras referencias.
+    const montoVentaNum = (tx.tipo === 'ingreso' && tx.monto_bruto !== null && tx.monto_bruto !== undefined && tx.monto_bruto !== '')
+      ? (parseFloat(tx.monto_bruto) || 0)
+      : montoNum;
     const oldGastoId = tx.gasto_id;
     const oldVentaId = tx.venta_id;
     const newGastoId = gasto_id !== undefined ? gasto_id : oldGastoId;
@@ -398,7 +413,7 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
         );
         if (oldVentas.length) {
           const oldVenta = oldVentas[0];
-          const nuevoMontoCobrado = Math.max(0, (parseFloat(oldVenta.monto_cobrado) || 0) - montoNum);
+          const nuevoMontoCobrado = Math.max(0, (parseFloat(oldVenta.monto_cobrado) || 0) - montoVentaNum);
           const totalVenta = parseFloat(oldVenta.total) || 0;
           let nuevoEstatus = 'pendiente';
           if (nuevoMontoCobrado >= totalVenta) nuevoEstatus = 'pagado';
@@ -419,7 +434,7 @@ router.put('/:id', auth, requireOrg, async (req, res, next) => {
         );
         if (newVentas.length) {
           const newVenta = newVentas[0];
-          const nuevoMontoCobrado = (parseFloat(newVenta.monto_cobrado) || 0) + montoNum;
+          const nuevoMontoCobrado = (parseFloat(newVenta.monto_cobrado) || 0) + montoVentaNum;
           const totalVenta = parseFloat(newVenta.total) || 0;
           let nuevoEstatus = 'pendiente';
           if (nuevoMontoCobrado >= totalVenta) nuevoEstatus = 'pagado';
@@ -567,6 +582,11 @@ router.delete('/:id', auth, requireOrg, async (req, res, next) => {
 
     const tx = trans[0];
     const montoNum = parseFloat(tx.monto) || 0;
+    // ✅ Negocio (Ventas):
+    // Si la transacción estaba vinculada a una venta, revertir el monto cobrado usando bruto si existe.
+    const montoVentaNum = (tx.tipo === 'ingreso' && tx.monto_bruto !== null && tx.monto_bruto !== undefined && tx.monto_bruto !== '')
+      ? (parseFloat(tx.monto_bruto) || 0)
+      : montoNum;
 
     // Revertir saldo de cuenta
     const ajuste = tx.tipo === 'ingreso' ? -montoNum : montoNum;
@@ -587,7 +607,7 @@ router.delete('/:id', auth, requireOrg, async (req, res, next) => {
       );
       if (ventas.length) {
         const venta = ventas[0];
-        const nuevoMontoCobrado = Math.max(0, (parseFloat(venta.monto_cobrado) || 0) - montoNum);
+        const nuevoMontoCobrado = Math.max(0, (parseFloat(venta.monto_cobrado) || 0) - montoVentaNum);
         const totalVenta = parseFloat(venta.total) || 0;
         let nuevoEstatus = 'pendiente';
         if (nuevoMontoCobrado >= totalVenta) nuevoEstatus = 'pagado';
