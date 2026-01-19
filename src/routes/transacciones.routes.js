@@ -3,6 +3,46 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../config/database');
 const { auth, requireOrg } = require('../middlewares/auth.middleware');
 
+// GET /api/transacciones/plataformas/saldos
+// Devuelve saldo por plataforma (Dinero en Plataforma) calculado como:
+// SUM(monto) de ingresos con estado_operacion = 'en_transito' agrupados por plataforma_origen.
+//
+// Relación:
+// - truno-front/bancos/index.html + bancos.js -> muestra tarjetas por plataforma
+// - truno-front/transacciones -> el usuario setea estado_operacion y plataforma_origen
+// - truno-back/src/db/migrate.js -> ensureEstadoOperacionColumn()
+router.get('/plataformas/saldos', auth, requireOrg, async (req, res, next) => {
+  try {
+    const orgId = req.organizacion.id;
+    const [rows] = await db.query(
+      `SELECT plataforma_origen, COALESCE(SUM(monto), 0) AS total
+       FROM transacciones
+       WHERE organizacion_id = ?
+         AND tipo = 'ingreso'
+         AND estado_operacion = 'en_transito'
+         AND plataforma_origen IS NOT NULL
+         AND plataforma_origen <> ''
+       GROUP BY plataforma_origen
+       ORDER BY total DESC`,
+      [orgId]
+    );
+
+    res.json({
+      plataformas: (rows || []).map(r => ({
+        plataforma_origen: r.plataforma_origen,
+        total: parseFloat(r.total) || 0
+      }))
+    });
+  } catch (err) {
+    // Compatibilidad: si la instalación no tiene la columna aún (o no hay permisos de ALTER),
+    // devolvemos vacío para no romper la UI.
+    if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+      return res.json({ plataformas: [] });
+    }
+    next(err);
+  }
+});
+
 // GET /api/transacciones
 router.get('/', auth, requireOrg, async (req, res, next) => {
   try {
